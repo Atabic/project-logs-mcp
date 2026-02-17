@@ -1,0 +1,20 @@
+# Render Blueprint – deploy this repo as a Web Service
+# Dashboard: https://dashboard.render.com → New → Blueprint
+# Or use "New Web Service" and leave Root Directory blank.
+
+services:
+  - type: web
+    name: project-logs-mcp
+    runtime: python
+    plan: free
+
+    buildCommand: pip install -r requirements-sse.txt
+    startCommand: python server_sse.py
+
+    # Python version: set by runtime.txt (python-3.12.0)
+    envVars:
+      # Add in Render Dashboard → Environment (sensitive values):
+      # - key: ERP_API_BASE_URL
+      #   value: https://your-erp.example.com/api/v1/
+      # - key: MCP_AUTHORIZED_USERS
+      #   sync: false  # set in Dashboard: comma-separated emails
