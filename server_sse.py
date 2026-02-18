@@ -78,7 +78,7 @@ def _erp_browser_html(session_id: str) -> str:
 </head>
 <body>
   <h1>ERP sign-in</h1>
-  <p>Log in on the streamed view below. Your token will be captured automatically when you sign in.</p>
+  <p>Live stream of the remote browser. <strong>Clicks and keystrokes are sent to the session</strong> (including Google login popups). Log in as usual; your token will be captured automatically.</p>
   <img id="view" alt="ERP browser stream" />
   <div id="status" class="loading">Connecting…</div>
   <script>
@@ -87,7 +87,6 @@ def _erp_browser_html(session_id: str) -> str:
       var base = {json.dumps(base)};
       var view = document.getElementById('view');
       var status = document.getElementById('status');
-      var scaleX = 1, scaleY = 1;
 
       function pollFrame() {{
         view.src = base + '/frame?t=' + Date.now();
@@ -96,12 +95,18 @@ def _erp_browser_html(session_id: str) -> str:
         fetch(base + '/status')
           .then(function(r) {{ return r.json(); }})
           .then(function(data) {{
+            if (data.error) {{
+              status.className = 'error';
+              status.textContent = data.error;
+              status.style.display = 'block';
+              return;
+            }}
             if (data.result) {{
               status.className = data.result.status === 'success' ? 'success' : 'error';
               status.textContent = data.result.status === 'success'
                 ? 'Authentication complete. You can close this window and return to Cursor.'
                 : (data.result.message || 'Something went wrong.');
-              status.id = 'status';
+              status.style.display = 'block';
               if (data.result.status === 'success') return;
             }}
             setTimeout(pollStatus, 500);
@@ -110,7 +115,7 @@ def _erp_browser_html(session_id: str) -> str:
       }}
 
       view.onload = function() {{
-        status.textContent = 'Connected. Interact with the view to log in.';
+        status.textContent = 'Connected. Click and type in the view to log in (e.g. Google login).';
         status.className = '';
       }};
       view.onerror = function() {{
@@ -119,6 +124,8 @@ def _erp_browser_html(session_id: str) -> str:
       }};
 
       view.onclick = function(e) {{
+        e.preventDefault();
+        e.stopPropagation();
         var rect = view.getBoundingClientRect();
         var x = (e.clientX - rect.left) * (1280 / rect.width);
         var y = (e.clientY - rect.top) * (720 / rect.height);
@@ -128,7 +135,9 @@ def _erp_browser_html(session_id: str) -> str:
           body: JSON.stringify({{ type: 'click', x: Math.round(x), y: Math.round(y) }})
         }}).catch(function() {{}});
       }};
+      view.onmousedown = view.onselectstart = function(e) {{ e.preventDefault(); }};
       document.onkeydown = function(e) {{
+        if (document.activeElement && document.activeElement !== document.body) return;
         fetch(base + '/input', {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},

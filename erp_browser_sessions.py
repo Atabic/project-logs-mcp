@@ -69,114 +69,154 @@ async def run_erp_browser_session(
     if not session or session.get("started") and session.get("browser_task"):
         return
     session["started"] = True
+    browser = None
+
+    def set_error(msg: str) -> None:
+        session["error"] = msg
+        session["event"].set()
 
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        session["error"] = "Playwright not installed"
-        session["event"].set()
+        set_error("Playwright not installed")
         return
 
-    async with async_playwright() as p:
-        try:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ],
-            )
-        except Exception as e:
-            session["error"] = str(e)
-            session["event"].set()
-            return
+    try:
+        async with async_playwright() as p:
+            try:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                    ],
+                )
+            except Exception as e:
+                set_error(str(e))
+                return
 
-        try:
-            context = await browser.new_context(
-                viewport=VIEWPORT,
-                ignore_https_errors=True,
-            )
-            page = await context.new_page()
-            session["page"] = page
-            await page.goto(erp_url, wait_until="domcontentloaded", timeout=60000)
-        except Exception as e:
-            session["error"] = f"Could not open ERP: {e}"
-            await browser.close()
-            session["event"].set()
-            return
+            try:
+                context = await browser.new_context(
+                    viewport=VIEWPORT,
+                    ignore_https_errors=True,
+                )
+                main_page = await context.new_page()
+                session["main_page"] = main_page
+                session["page"] = main_page  # active page we stream and send input to (main or popup)
 
-        deadline = time.monotonic() + LOGIN_WAIT_TIMEOUT
-        token = None
-        email = None
-
-        try:
-            while time.monotonic() < deadline and not session.get("closed"):
-                # Process pending input (non-blocking)
-                while True:
+                async def on_popup(popup):
+                    # Google OAuth etc. open in a popup; stream and control the popup so user can complete login
+                    session["page"] = popup
                     try:
-                        ev = session["input_queue"].get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
+                        await popup.set_viewport_size(VIEWPORT["width"], VIEWPORT["height"])
+                    except Exception:
+                        pass
+                    def on_close():
+                        if session.get("page") is popup:
+                            session["page"] = session.get("main_page")
+                    popup.once("close", on_close)
+
+                context.on("page", on_popup)
+
+                # One initial screenshot so the client gets a frame immediately (avoids "Connecting…" with no feedback)
+                try:
+                    session["last_screenshot"] = await main_page.screenshot(type="png", timeout=3000)
+                except Exception:
+                    pass
+                await main_page.goto(erp_url, wait_until="domcontentloaded", timeout=60000)
+            except Exception as e:
+                set_error(f"Could not open ERP: {e}")
+                await browser.close()
+                return
+
+            deadline = time.monotonic() + LOGIN_WAIT_TIMEOUT
+            token = None
+            email = None
+
+            try:
+                while time.monotonic() < deadline and not session.get("closed"):
+                    active_page = session.get("page")
+                    # Process pending input (non-blocking) – send to whichever page we're streaming (main or popup)
+                    while True:
+                        try:
+                            ev = session["input_queue"].get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        try:
+                            if ev.get("type") == "click" and active_page:
+                                x = ev.get("x", 0)
+                                y = ev.get("y", 0)
+                                await active_page.mouse.click(x, y)
+                            elif ev.get("type") == "key" and active_page:
+                                key = ev.get("key")
+                                if key:
+                                    await active_page.keyboard.press(key)
+                            elif ev.get("type") == "type" and active_page:
+                                text = ev.get("text", "")
+                                await active_page.keyboard.type(text, delay=10)
+                        except Exception:
+                            pass
+
+                    # Screenshot the active page (main or popup) so user sees what they're interacting with
                     try:
-                        if ev.get("type") == "click" and session["page"]:
-                            x = ev.get("x", 0)
-                            y = ev.get("y", 0)
-                            await session["page"].mouse.click(x, y)
-                        elif ev.get("type") == "key" and session["page"]:
-                            key = ev.get("key")
-                            if key:
-                                await session["page"].keyboard.press(key)
-                        elif ev.get("type") == "type" and session["page"]:
-                            text = ev.get("text", "")
-                            await session["page"].keyboard.type(text, delay=10)
+                        if active_page:
+                            shot = await active_page.screenshot(type="png", timeout=2000)
+                            session["last_screenshot"] = shot
+                            session["last_screenshot_time"] = time.monotonic()
                     except Exception:
                         pass
 
-                # Screenshot
-                try:
-                    shot = await page.screenshot(type="png", timeout=2000)
-                    session["last_screenshot"] = shot
-                    session["last_screenshot_time"] = time.monotonic()
-                except Exception:
-                    pass
-
-                # Check token
-                try:
-                    token = await page.evaluate(
-                        f"() => window.localStorage && window.localStorage.getItem('{ERP_LOCALSTORAGE_TOKEN_KEY}')"
-                    )
-                    if token and isinstance(token, str) and token.strip():
+                    # Token lives in the main window's localStorage after OAuth popup closes
+                    main = session.get("main_page")
+                    if main:
                         try:
-                            email = await page.evaluate(
-                                "() => window.localStorage && window.localStorage.getItem('username')"
+                            token = await main.evaluate(
+                                f"() => window.localStorage && window.localStorage.getItem('{ERP_LOCALSTORAGE_TOKEN_KEY}')"
                             )
+                            if token and isinstance(token, str) and token.strip():
+                                try:
+                                    email = await main.evaluate(
+                                        "() => window.localStorage && window.localStorage.getItem('username')"
+                                    )
+                                except Exception:
+                                    pass
+                                break
                         except Exception:
                             pass
-                        break
+
+                    await asyncio.sleep(POLL_INTERVAL)
+            finally:
+                session["closed"] = True
+                try:
+                    await browser.close()
                 except Exception:
                     pass
+                session["page"] = None
+                session["main_page"] = None
 
-                await asyncio.sleep(POLL_INTERVAL)
-        finally:
-            session["closed"] = True
-            await browser.close()
-            session["page"] = None
-
-        if token and isinstance(token, str) and token.strip():
+            if token and isinstance(token, str) and token.strip():
+                try:
+                    session["store_token"](
+                        token.strip(),
+                        email.strip() if email and isinstance(email, str) else None,
+                    )
+                    session["result"] = {"status": "success", "email": email}
+                except Exception as e:
+                    session["result"] = {"status": "error", "message": str(e)}
+            else:
+                session["result"] = {
+                    "status": "error",
+                    "message": "No token found. Log in on the ERP page within the time limit.",
+                }
+            session["event"].set()
+    except Exception as e:
+        set_error(str(e))
+        if browser:
             try:
-                session["store_token"](
-                    token.strip(),
-                    email.strip() if email and isinstance(email, str) else None,
-                )
-                session["result"] = {"status": "success", "email": email}
-            except Exception as e:
-                session["result"] = {"status": "error", "message": str(e)}
-        else:
-            session["result"] = {
-                "status": "error",
-                "message": "No token found. Log in on the ERP page within the time limit.",
-            }
-        session["event"].set()
-        # Do not remove_session here so client can fetch /status and see result
+                await browser.close()
+            except Exception:
+                pass
+        session["page"] = None
+        session["closed"] = True
