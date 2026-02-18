@@ -406,6 +406,17 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                     "message": "Signed in via ERP browser. Token captured; you can use other tools now.",
                     "email": result.get("email")
                 }, indent=2))]
+            if result.get("status") == "deployed":
+                msg = (
+                    result.get("message", "")
+                    + "\n\n**Open this URL in your browser:** "
+                    + result.get("url", "")
+                )
+                return [TextContent(type="text", text=json.dumps({
+                    "status": "deployed",
+                    "url": result.get("url"),
+                    "message": msg,
+                }, indent=2))]
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         elif name == "get_week_logs":

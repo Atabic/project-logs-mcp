@@ -9,9 +9,14 @@ Run with:
 Then the MCP URL is: http://<host>:<port>/sse
 Clients POST messages to /messages/ (session_id from the SSE endpoint event).
 
+When deployed (MCP_SSE_PUBLIC_URL set), authenticate_via_erp_browser returns a URL;
+opening it streams a headless Playwright browser so the user can log in to ERP.
+
 Requires: pip install -r requirements-sse.txt
 """
 
+import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -22,6 +27,9 @@ if str(current_dir) not in sys.path:
 
 # Must import app from server (shared MCP server instance)
 from server import app
+
+from erp_browser_sessions import get_session, run_erp_browser_session, _browser_task_lock
+from erp_browser_auth import _erp_base_url
 
 def _get_send(request):
     """Get ASGI send callable from Starlette request."""
@@ -46,10 +54,101 @@ async def handle_sse(request):
     return Response()
 
 
+def _erp_browser_html(session_id: str) -> str:
+    """HTML page that displays streamed Playwright screenshot and forwards input."""
+    base = f"/erp-browser/{session_id}"
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ERP sign-in – Project Logs MCP</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{ font-family: system-ui, sans-serif; margin: 0; background: #1a1a1a; color: #e0e0e0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 16px; }}
+    h1 {{ font-size: 1.1rem; font-weight: 600; margin-bottom: 8px; }}
+    p {{ color: #999; font-size: 0.9rem; margin: 0 0 12px 0; text-align: center; max-width: 640px; }}
+    #view {{ background: #000; border-radius: 8px; box-shadow: 0 4px 24px rgba(0,0,0,0.5); cursor: pointer; max-width: 100%; height: auto; display: block; }}
+    #view:not([src]) {{ min-height: 360px; display: flex; align-items: center; justify-content: center; color: #666; }}
+    #status {{ margin-top: 12px; padding: 12px; border-radius: 8px; font-size: 0.9rem; display: none; }}
+    #status.success {{ display: block; background: #0d6832; color: #fff; }}
+    #status.error {{ display: block; background: #c5221f; color: #fff; }}
+    #status.loading {{ display: block; color: #999; }}
+  </style>
+</head>
+<body>
+  <h1>ERP sign-in</h1>
+  <p>Log in on the streamed view below. Your token will be captured automatically when you sign in.</p>
+  <img id="view" alt="ERP browser stream" />
+  <div id="status" class="loading">Connecting…</div>
+  <script>
+    (function() {{
+      var sid = {json.dumps(session_id)};
+      var base = {json.dumps(base)};
+      var view = document.getElementById('view');
+      var status = document.getElementById('status');
+      var scaleX = 1, scaleY = 1;
+
+      function pollFrame() {{
+        view.src = base + '/frame?t=' + Date.now();
+      }}
+      function pollStatus() {{
+        fetch(base + '/status')
+          .then(function(r) {{ return r.json(); }})
+          .then(function(data) {{
+            if (data.result) {{
+              status.className = data.result.status === 'success' ? 'success' : 'error';
+              status.textContent = data.result.status === 'success'
+                ? 'Authentication complete. You can close this window and return to Cursor.'
+                : (data.result.message || 'Something went wrong.');
+              status.id = 'status';
+              if (data.result.status === 'success') return;
+            }}
+            setTimeout(pollStatus, 500);
+          }})
+          .catch(function() {{ setTimeout(pollStatus, 1000); }});
+      }}
+
+      view.onload = function() {{
+        status.textContent = 'Connected. Interact with the view to log in.';
+        status.className = '';
+      }};
+      view.onerror = function() {{
+        status.className = 'loading';
+        status.textContent = 'Waiting for browser…';
+      }};
+
+      view.onclick = function(e) {{
+        var rect = view.getBoundingClientRect();
+        var x = (e.clientX - rect.left) * (1280 / rect.width);
+        var y = (e.clientY - rect.top) * (720 / rect.height);
+        fetch(base + '/input', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ type: 'click', x: Math.round(x), y: Math.round(y) }})
+        }}).catch(function() {{}});
+      }};
+      document.onkeydown = function(e) {{
+        fetch(base + '/input', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ type: 'key', key: e.key }})
+        }}).catch(function() {{}});
+      }};
+
+      setInterval(pollFrame, 120);
+      pollStatus();
+      pollFrame();
+    }})();
+  </script>
+</body>
+</html>"""
+
+
 def create_starlette_app():
     from starlette.applications import Starlette
     from starlette.routing import Route, Mount
-    from starlette.responses import PlainTextResponse
+    from starlette.responses import PlainTextResponse, HTMLResponse, Response, JSONResponse
     from mcp.server.sse import SseServerTransport
 
     sse = SseServerTransport("/messages/")
@@ -61,9 +160,57 @@ def create_starlette_app():
             status_code=200,
         )
 
+    async def erp_browser_page(request):
+        session_id = request.path_params.get("session_id")
+        if not session_id:
+            return PlainTextResponse("Missing session", status_code=400)
+        session = get_session(session_id)
+        if not session:
+            return PlainTextResponse("Session not found or expired.", status_code=404)
+        async with _browser_task_lock:
+            if not session.get("browser_task"):
+                erp_url = _erp_base_url()
+                session["browser_task"] = asyncio.create_task(
+                    run_erp_browser_session(session_id, erp_url)
+                )
+        return HTMLResponse(_erp_browser_html(session_id))
+
+    async def erp_browser_frame(request):
+        session_id = request.path_params.get("session_id")
+        session = get_session(session_id) if session_id else None
+        if not session:
+            return Response(status_code=404)
+        shot = session.get("last_screenshot")
+        if not shot:
+            return Response(status_code=204)
+        return Response(shot, media_type="image/png")
+
+    async def erp_browser_input(request):
+        session_id = request.path_params.get("session_id")
+        session = get_session(session_id) if session_id else None
+        if not session:
+            return Response(status_code=404)
+        try:
+            body = await request.json()
+            session.get("input_queue").put_nowait(body)
+        except Exception:
+            pass
+        return Response(status_code=204)
+
+    async def erp_browser_status(request):
+        session_id = request.path_params.get("session_id")
+        session = get_session(session_id) if session_id else None
+        if not session:
+            return Response(status_code=404)
+        return JSONResponse({"result": session.get("result"), "error": session.get("error")})
+
     routes = [
         Route("/", endpoint=homepage),
         Route("/sse", endpoint=handle_sse, methods=["GET"]),
+        Route("/erp-browser/{session_id}", endpoint=erp_browser_page, methods=["GET"]),
+        Route("/erp-browser/{session_id}/frame", endpoint=erp_browser_frame, methods=["GET"]),
+        Route("/erp-browser/{session_id}/input", endpoint=erp_browser_input, methods=["POST"]),
+        Route("/erp-browser/{session_id}/status", endpoint=erp_browser_status, methods=["GET"]),
         Mount("/messages/", app=sse.handle_post_message),
     ]
     starlette_app = Starlette(routes=routes)

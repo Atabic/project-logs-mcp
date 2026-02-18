@@ -8,7 +8,7 @@ services:
     runtime: python
     plan: free
 
-    buildCommand: pip install -r requirements-sse.txt
+    buildCommand: pip install -r requirements-sse.txt && playwright install chromium
     startCommand: python server_sse.py
 
     # Python version: set by runtime.txt (python-3.12.0)
@@ -16,5 +16,7 @@ services:
       # Add in Render Dashboard → Environment (sensitive values):
       # - key: ERP_API_BASE_URL
       #   value: https://your-erp.example.com/api/v1/
+      # - key: MCP_SSE_PUBLIC_URL
+      #   value: https://project-logs-mcp.onrender.com  # your deployed MCP URL (enables ERP browser auth from deployed URL)
       # - key: MCP_AUTHORIZED_USERS
       #   sync: false  # set in Dashboard: comma-separated emails

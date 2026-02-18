@@ -77,6 +77,7 @@ The server is designed to be invoked by MCP clients automatically. See "Connecti
 - `MCP_GOOGLE_CLIENT_ID`: Google OAuth client ID (same as Django `EXTERNAL_GOOGLE_CLIENT_ID`). Required for **browser sign-in** (`authenticate_via_browser`). Get it from your Google Cloud Console and add `http://127.0.0.1:8765/callback` to **Authorized redirect URIs** (or `http://127.0.0.1:<MCP_OAUTH_PORT>/callback` if you change the port).
 - `MCP_OAUTH_PORT`: Port for the local sign-in server (default: `8765`). Must match the redirect URI whitelisted in Google Cloud Console.
 - `MCP_SSE_HOST`: When running the SSE server (`server_sse.py`), bind address (default: `0.0.0.0`).
+- `MCP_SSE_PUBLIC_URL`: When **deployed** (e.g. on Render), set this to your public MCP URL (e.g. `https://project-logs-mcp.onrender.com`). This enables **ERP browser auth from the deployed URL**: the tool returns a link that opens a streamed browser so you can log in without a local browser.
 
 ### Connecting to an LLM
 
@@ -178,12 +179,13 @@ To expose this MCP over HTTP so **any AI app can add it via an MCP URL** (e.g. `
       - **Name:** e.g. `project-logs-mcp`
       - **Region:** choose closest to you
       - **Root Directory:** leave blank (app is at repo root)
-      - **Runtime:** Python 3
-      - **Build Command:** `pip install -r requirements-sse.txt`
-      - **Start Command:** `python server_sse.py`
+      - **Runtime:** **Docker** (recommended so ERP browser auth works; Chromium is pre-installed in the image).  
+        If you use **Python** instead: **Build Command:** `pip install -r requirements-sse.txt && playwright install chromium`  
+        **Start Command:** `python server_sse.py`
    4. Under **Environment**, add:
       - `ERP_API_BASE_URL` = your ERP API base URL (e.g. `https://your-erp.example.com/api/v1/`)
       - `MCP_AUTHORIZED_USERS` = your allowed emails (comma-separated)
+      - **For ERP browser auth from the deployed URL:** `MCP_SSE_PUBLIC_URL` = your service URL, e.g. `https://project-logs-mcp.onrender.com` (no trailing slash). Then when you call `authenticate_via_erp_browser`, the MCP returns a link; open it to log in via a streamed browser.
    5. Click **Create Web Service**. Wait for the first deploy to finish.
    6. Your MCP URL is: **`https://<your-service-name>.onrender.com/sse`** (use this in AI apps that support remote MCP URL). The server reads `PORT` from the environment automatically.
 
@@ -265,14 +267,16 @@ Sign in by opening a URL in your browser (like Figma MCP). No token copying.
 ### 1d. `authenticate_via_erp_browser` (open ERP in your browser, token captured automatically)
 The MCP opens the ERP site in a browser, you log in, and the MCP reads the token from the page—no copy/paste.
 
-**Flow:**
+**Flow (local):**
 1. User (or LLM) calls the tool `authenticate_via_erp_browser`.
 2. A browser window opens to your ERP site (your installed **Chrome** or **Edge** is used when available; otherwise Playwright’s Chromium).
 3. You log in on that page (email or Google, same as normal ERP).
 4. The MCP detects the token on the page and stores it; the browser can close.
 5. Other MCP tools then use that token automatically.
 
-**Requirements:** Playwright. The MCP prefers your installed Chrome or Edge; if you have neither, install Chromium: `pip install playwright` then `playwright install chromium`. No Google Client ID.
+**Flow (deployed, e.g. Render):** When `MCP_SSE_PUBLIC_URL` is set, the tool does **not** open a local browser. Instead it returns a **URL**. Open that URL in your own browser: you’ll see a live stream of a headless ERP session. Log in there (click and type in the streamed view); when the token is detected, the MCP stores it and you can close the tab. Requires Playwright and Chromium on the server (see **Deploying** below).
+
+**Requirements:** Playwright. Locally: prefer Chrome or Edge; otherwise `pip install playwright` then `playwright install chromium`. No Google Client ID.
 
 **Parameters:** None.
 

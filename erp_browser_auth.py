@@ -1,8 +1,10 @@
 """
 Authenticate by opening your ERP site in the browser and reading the token automatically.
 
-Uses your installed Chrome or Edge when possible (via Playwright). Opens the ERP URL, you log in,
-and the MCP captures the token from the page—no copy/paste.
+- Local: uses your installed Chrome or Edge (via Playwright), headless=False; you log in in the
+  local window and the MCP captures the token.
+- Deployed (e.g. Render): when MCP_SSE_PUBLIC_URL is set, returns a URL. Opening it streams
+  a headless Playwright browser so you can log in in your own browser; token is captured.
 """
 
 import asyncio
@@ -28,14 +30,37 @@ def _erp_base_url() -> str:
     return base.rstrip("/") or "https://your-erp.example.com"
 
 
+def _is_deployed() -> bool:
+    """True when running in a deployed environment with a public URL for ERP browser flow."""
+    return bool(os.getenv("MCP_SSE_PUBLIC_URL", "").strip())
+
+
+def _public_base_url() -> str:
+    """Base URL of this MCP server (e.g. https://project-logs-mcp.onrender.com). Required when deployed."""
+    return os.getenv("MCP_SSE_PUBLIC_URL", "").strip().rstrip("/")
+
+
 async def authenticate_via_erp_browser(
     store_token: Callable[[str, Optional[str]], None],
 ) -> dict:
     """
     Open ERP in your browser (Chrome, Edge, or Chromium), wait for you to log in,
     then read the token from the page and store it. No copy/paste.
-    Prefers your installed Chrome, then Edge, then Playwright's Chromium.
+    - Local: launches a visible browser on this machine.
+    - Deployed: returns a URL; open it to use a streamed browser and log in there.
     """
+    if _is_deployed():
+        from erp_browser_sessions import create_session
+
+        session_id = create_session(store_token)
+        base = _public_base_url()
+        url = f"{base}/erp-browser/{session_id}"
+        return {
+            "status": "deployed",
+            "url": url,
+            "message": "Open this URL in your browser to log in to ERP. The page will show a live view of the ERP site; log in there and the token will be captured automatically.",
+        }
+
     try:
         from playwright.async_api import async_playwright
     except ImportError:
