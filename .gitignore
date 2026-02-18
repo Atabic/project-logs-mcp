@@ -25,3 +25,6 @@ Thumbs.db
 
 # Config (keep example, ignore actual)
 authorized_users.json
+
+# Playwright browsers (used on Render when PLAYWRIGHT_BROWSERS_PATH=./playwright-browsers)
+playwright-browsers/
