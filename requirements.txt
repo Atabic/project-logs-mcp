@@ -1,12 +1,2 @@
-# Standalone MCP Server Requirements
-# This server is completely independent from Django
-
-# MCP SDK
-mcp>=1.0.0
-
-# HTTP client for API calls
-aiohttp>=3.9.0
-
-# authenticate_via_erp_browser: open ERP in your browser and auto-capture token (uses Chrome/Edge when installed)
-playwright>=1.40.0
-
+fastmcp~=3.0
+httpx~=0.28

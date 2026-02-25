@@ -1,7 +1,0 @@
-# Base MCP server dependencies
--r requirements.txt
-
-# HTTP/SSE transport (for deployable MCP URL)
-starlette>=0.37.0
-sse-starlette>=2.0.0
-uvicorn[standard]>=0.30.0

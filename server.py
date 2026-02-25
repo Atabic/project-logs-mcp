@@ -1,803 +1,598 @@
-#!/usr/bin/env python3
-"""
-Standalone MCP Server for Project Logs.
+"""ERP MCP Server — FastMCP v3 with Google OAuth.
 
-This server communicates with the ERP production API and includes
-authentication and authorization to ensure only authorized users can access it.
+Exposes ERP time-logging tools via the Model Context Protocol.
+Authentication flows through Google OAuth (FastMCP GoogleProvider);
+the raw Google access token is exchanged for an ERP session token
+on every tool call.
 """
 
-import asyncio
-import json
+from __future__ import annotations
+
+import functools
+import importlib.metadata
+import logging
 import os
-import sys
-from typing import Any, Optional
-from pathlib import Path
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from datetime import date as date_type
+from typing import Any, ParamSpec, TypeVar
 
-# Ensure we can import from the same directory (standalone, no parent dependencies)
-# Add current directory to path for local imports only
-current_dir = Path(__file__).parent.resolve()
-if str(current_dir) not in sys.path:
-    sys.path.insert(0, str(current_dir))
+from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.auth import AccessToken
+from fastmcp.server.auth.providers.google import GoogleProvider
+from fastmcp.server.dependencies import get_access_token
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+
+from erp_client import ERPClient
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger("erp_mcp.server")
+
+# Configure logging; LOG_LEVEL env var overrides the default INFO level.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+ALLOWED_DOMAIN: str = os.environ.get("ALLOWED_DOMAIN", "arbisoft.com").lower().strip()
+ERP_BASE_URL: str = os.environ.get(
+    "ERP_API_BASE_URL", "https://erp.arbisoft.com/api/v1/"
+)
 
 try:
-    from mcp import Server
-    from mcp.server.stdio import stdio_server
-    from mcp.types import Tool, TextContent
-except ImportError:
-    try:
-        from mcp.server import Server
-        from mcp.server.stdio import stdio_server
-        from mcp.types import Tool, TextContent
-    except ImportError:
-        raise ImportError(
-            "MCP SDK not installed. Install it with: pip install mcp aiohttp"
-        )
+    _APP_VERSION: str = importlib.metadata.version("erp-mcp")
+except importlib.metadata.PackageNotFoundError:
+    _APP_VERSION = os.environ.get("APP_VERSION", "dev")
 
-# Import from same directory (standalone, no Django dependencies)
-from api_client import ProjectLogsAPIClient
-from auth import AuthenticationManager
-from oauth_server import (
-    get_login_url,
-    start_oauth_server,
-    GOOGLE_CLIENT_ID,
-    DEFAULT_OAUTH_PORT,
+# ---------------------------------------------------------------------------
+# Auth provider + FastMCP instance
+# ---------------------------------------------------------------------------
+
+_google_client_id: str = os.environ.get("GOOGLE_CLIENT_ID", "")
+_google_client_secret: str = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+
+auth = GoogleProvider(
+    client_id=_google_client_id,
+    client_secret=_google_client_secret,
+    base_url=os.environ.get("MCP_BASE_URL", "https://erp.arbisoft.com"),
+    redirect_path="/callback",
+    required_scopes=[
+        "openid",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+    ],
 )
-from erp_browser_auth import authenticate_via_erp_browser as _authenticate_via_erp_browser
 
 
-# Initialize components
-BASE_URL = os.getenv("ERP_API_BASE_URL", "https://your-erp.example.com/api/v1/")
-auth_manager = AuthenticationManager()
-api_client = ProjectLogsAPIClient(BASE_URL, auth_manager)
+# Module-level singleton — requires single-worker deployment (stateless_http=True).
+# Tests must patch via `server.erp = mock_client` or use the _patch_erp fixture.
+erp: ERPClient | None = None  # initialized in _lifespan
 
-# Create MCP server
-app = Server("project-logs-mcp-standalone")
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
-@app.list_tools()
-async def list_tools() -> list[Tool]:
-    """List all available tools for project logs."""
-    return [
-        Tool(
-            name="authenticate_with_token",
-            description="Authenticate with ERP system using an Authorization token. Get your token from the browser's network tab (Authorization header value).",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "token": {
-                        "type": "string",
-                        "description": "Authorization token value. Can be 'Token xyz' or just 'xyz'. Get this from your browser's network tab when making API calls to your ERP host."
-                    },
-                    "email": {
-                        "type": "string",
-                        "description": "Optional email address for identification (used for authorization check if configured)"
-                    }
-                },
-                "required": ["token"]
-            }
-        ),
-        Tool(
-            name="authenticate_with_google",
-            description="Sign in with Google: pass a Google OAuth access token; MCP calls the ERP backend (core/google-login/) to verify it and obtain an ERP session token. Use this when the user has signed in with Gmail and you have their Google access_token (e.g. from a client app or OAuth flow).",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "access_token": {
-                        "type": "string",
-                        "description": "Google OAuth access token from signing in with Google (e.g. from a web/mobile client that did Google Sign-In)"
-                    },
-                    "email": {
-                        "type": "string",
-                        "description": "Optional email for identification; if omitted, backend returns the email from Google"
-                    }
-                },
-                "required": ["access_token"]
-            }
-        ),
-        Tool(
-            name="authenticate_via_browser",
-            description="Sign in via browser (like Figma MCP): returns a URL for the user to open. User signs in with Google in the browser, is redirected back to complete auth, then can close the window and use other MCP tools. Call this when the user wants to log in without copying a token.",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        ),
-        Tool(
-            name="authenticate_via_erp_browser",
-            description="Open ERP in your browser (Chrome, Edge, or Chromium); you log in and the MCP captures the token automatically. No copy/paste.",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        ),
-        Tool(
-            name="get_week_logs",
-            description="Get project logs for a specific week. Requires authentication.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "week_starting": {
-                        "type": "string",
-                        "description": "Week starting date in YYYY-MM-DD format",
-                        "format": "date"
-                    },
-                    "email": {
-                        "type": "string",
-                        "description": "Optional email address (uses current authenticated user if not provided)"
-                    }
-                },
-                "required": ["week_starting"]
-            }
-        ),
-        Tool(
-            name="get_day_logs",
-            description="Get detailed project logs for a specific day. Returns all projects, tasks, and time logged for that day. Requires authentication.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "date": {
-                        "type": "string",
-                        "description": "Date in YYYY-MM-DD format",
-                        "format": "date"
-                    },
-                    "email": {
-                        "type": "string",
-                        "description": "Optional email address (uses current authenticated user if not provided)"
-                    }
-                },
-                "required": ["date"]
-            }
-        ),
-        Tool(
-            name="get_logs_for_date_range",
-            description="Get project logs for a date range. Requires authentication.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "start_date": {
-                        "type": "string",
-                        "description": "Start date in YYYY-MM-DD format",
-                        "format": "date"
-                    },
-                    "end_date": {
-                        "type": "string",
-                        "description": "End date in YYYY-MM-DD format",
-                        "format": "date"
-                    },
-                    "email": {
-                        "type": "string",
-                        "description": "Optional email address (uses current authenticated user if not provided)"
-                    }
-                },
-                "required": ["start_date", "end_date"]
-            }
-        ),
-        Tool(
-            name="create_or_update_log",
-            description="Add a time log for a date: specify date, project (by id or name), hours, description. Optionally set label (by id or name). Week log is used automatically when it exists; otherwise Slack endpoint is tried. Saving is done via backend Save API when possible.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "date": {"type": "string", "description": "Date in YYYY-MM-DD", "format": "date"},
-                    "project_id": {"type": "integer", "description": "Project/subteam ID (from get_active_projects). Use this or project_name."},
-                    "project_name": {"type": "string", "description": "Project/team name (e.g. 'Your Project Name'). Resolved to ID automatically."},
-                    "description": {"type": "string", "description": "Description of work done"},
-                    "hours": {"type": "number", "description": "Hours (decimal ok, e.g. 2 or 8.5)", "minimum": 0, "maximum": 24},
-                    "label_id": {"type": "integer", "description": "Optional label ID (from get_log_labels). Use this or label_name."},
-                    "label_name": {"type": "string", "description": "Optional label name (e.g. 'Coding'). Resolved to ID automatically."},
-                    "email": {"type": "string", "description": "Optional; uses current user if omitted"}
-                },
-                "required": ["date", "description", "hours"],
-                "anyOf": [{"required": ["project_id"]}, {"required": ["project_name"]}]
-            }
-        ),
-        Tool(
-            name="delete_log",
-            description="Remove a time log entry for a date. Specify date, project (by id or name), and the exact task description. Requires authentication.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "date": {"type": "string", "description": "Date in YYYY-MM-DD format", "format": "date"},
-                    "project_id": {"type": "integer", "description": "Project/subteam ID (from get_active_projects). Use this or project_name."},
-                    "project_name": {"type": "string", "description": "Project/team name (e.g. 'Your Project Name'). Resolved to ID automatically."},
-                    "description": {"type": "string", "description": "Exact task description of the log entry to remove"},
-                    "email": {"type": "string", "description": "Optional; uses current user if omitted"}
-                },
-                "required": ["date", "description"],
-                "anyOf": [{"required": ["project_id"]}, {"required": ["project_name"]}]
-            }
-        ),
-        Tool(
-            name="complete_week_log",
-            description="Mark a week's project logs as completed. Requires authentication.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "week_starting": {
-                        "type": "string",
-                        "description": "Week starting date in YYYY-MM-DD format",
-                        "format": "date"
-                    },
-                    "email": {
-                        "type": "string",
-                        "description": "Optional email address (uses current authenticated user if not provided)"
-                    },
-                    "save_draft": {
-                        "type": "boolean",
-                        "description": "If true, saves as draft without completing. Default is false.",
-                        "default": False
-                    }
-                },
-                "required": ["week_starting"]
-            }
-        ),
-        Tool(
-            name="get_active_projects",
-            description="Get list of active projects/subteams for a person. Requires authentication.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "email": {
-                        "type": "string",
-                        "description": "Optional email address (uses current authenticated user if not provided)"
-                    }
-                },
-                "required": []
-            }
-        ),
-        Tool(
-            name="check_person_week_project_exists",
-            description="Check if PersonWeekProject exists for a given date and project. PersonWeekProject is required before adding logs. It links PersonWeekLog (for the week) and PersonTeam (linking person to subteam). Returns what's needed if it doesn't exist. Requires authentication.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "date": {
-                        "type": "string",
-                        "description": "Date in YYYY-MM-DD format",
-                        "format": "date"
-                    },
-                    "project_id": {
-                        "type": ["integer", "string"],
-                        "description": "Project/subteam ID (from active_projects) or project name"
-                    },
-                    "email": {
-                        "type": "string",
-                        "description": "Optional email address (uses current authenticated user if not provided)"
-                    }
-                },
-                "required": ["date", "project_id"]
-            }
-        ),
-        Tool(
-            name="get_log_labels",
-            description="Get available log labels for categorizing log entries. Requires authentication.",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        ),
-        Tool(
-            name="get_month_logs",
-            description="Get all project logs for a specific month and year. Requires authentication.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "year": {
-                        "type": "integer",
-                        "description": "Year (e.g., 2024)"
-                    },
-                    "month": {
-                        "type": "integer",
-                        "description": "Month (1-12)"
-                    },
-                    "email": {
-                        "type": "string",
-                        "description": "Optional email address (uses current authenticated user if not provided)"
-                    }
-                },
-                "required": ["year", "month"]
-            }
-        ),
-        Tool(
-            name="fill_logs_for_days",
-            description="Fill logs for multiple days at once. Useful for bulk operations. Requires authentication.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "start_date": {
-                        "type": "string",
-                        "description": "Start date in YYYY-MM-DD format",
-                        "format": "date"
-                    },
-                    "end_date": {
-                        "type": "string",
-                        "description": "End date in YYYY-MM-DD format",
-                        "format": "date"
-                    },
-                    "project_id": {
-                        "type": ["integer", "string"],
-                        "description": "ID of the project/subteam, OR project/team name (e.g., 'Your Project Name'). If a name is provided, the MCP will automatically find the matching project ID."
-                    },
-                    "project_name": {
-                        "type": "string",
-                        "description": "Optional: Project/team name to search for. If provided, project_id will be resolved from this name. If both project_id and project_name are provided, project_name takes precedence. Example: 'Your Project Name'"
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Description of the work done"
-                    },
-                    "email": {
-                        "type": "string",
-                        "description": "Optional email address (uses current authenticated user if not provided)"
-                    },
-                    "hours_per_day": {
-                        "type": "number",
-                        "description": "Hours to log per day (default: 8)",
-                        "default": 8
-                    },
-                    "label_id": {
-                        "type": "integer",
-                        "description": "Optional label ID"
-                    },
-                    "skip_weekends": {
-                        "type": "boolean",
-                        "description": "Skip weekends (Saturday and Sunday). Default is false.",
-                        "default": False
-                    }
-                },
-                "required": ["start_date", "end_date", "project_id", "description"]
-            }
+@asynccontextmanager
+async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
+    """Manage application resources during server lifecycle."""
+    global erp  # intentional module-level singleton
+    if not _google_client_id or not _google_client_secret:
+        logger.critical("GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are not set — refusing to start")
+        raise SystemExit(1)
+    erp = ERPClient(base_url=ERP_BASE_URL, allowed_domain=ALLOWED_DOMAIN)
+    logger.info("ERP MCP server starting up")
+    try:
+        yield
+    finally:
+        logger.info("ERP MCP server shutting down")
+        if erp is not None:
+            await erp.close()
+
+
+def _get_erp() -> ERPClient:
+    """Return the ERPClient singleton, or raise if server hasn't started."""
+    if erp is None:
+        raise RuntimeError("ERPClient not initialized. Server lifespan has not started.")
+    return erp
+
+
+mcp = FastMCP(name="erp-mcp", auth=auth, lifespan=_lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Security headers middleware (defense-in-depth for HTTP responses)
+# ---------------------------------------------------------------------------
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Inject hardening headers into every HTTP response."""
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        response: Response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        return response
+
+
+# Starlette Middleware descriptor passed to mcp.run()/mcp.http_app() at startup.
+_security_middleware = Middleware(SecurityHeadersMiddleware)
+
+
+# ---------------------------------------------------------------------------
+# Health check endpoint (used by Docker HEALTHCHECK)
+# ---------------------------------------------------------------------------
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> JSONResponse:
+    """Return 200 OK for Docker health checks and load balancers."""
+    return JSONResponse({"status": "ok"})
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+_MAX_FILL_DAYS: int = 31
+_MAX_QUERY_DAYS: int = 366
+_MAX_DESCRIPTION_LEN: int = 5000
+
+
+def _check_erp_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Raise ToolError if ERPClient returned an error dict."""
+    if isinstance(result, dict) and result.get("status") == "error":
+        raise ToolError(result.get("message", "ERP operation failed"))
+    return result
+
+
+def _tool_error_handler(
+    error_message: str,
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    """Decorator that wraps MCP tool functions with standard error handling.
+
+    Converts PermissionError and ValueError to ToolError (preserving message),
+    and catches all other exceptions with a generic message (SEC-04).
+    """
+
+    def decorator(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        @functools.wraps(fn)
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            try:
+                return await fn(*args, **kwargs)
+            except ToolError:
+                raise  # Already a ToolError, pass through
+            except PermissionError as exc:
+                raise ToolError(str(exc)) from exc
+            except ValueError as exc:
+                raise ToolError(str(exc)) from exc
+            except Exception:
+                logger.exception("%s failed", fn.__name__)
+                raise ToolError(error_message) from None
+
+        return wrapper
+
+    return decorator
+
+
+async def _get_erp_token() -> tuple[str, str]:
+    """Extract Google token from the current request, enforce domain, exchange for ERP token.
+
+    Returns:
+        (erp_token, email) tuple.
+
+    Raises:
+        PermissionError: If domain check fails or token is missing.
+    """
+    access_token: AccessToken | None = get_access_token()
+    if access_token is None:
+        raise PermissionError("Authentication required. Please sign in with Google.")
+
+    # --- SEC-02: Domain restriction at MCP layer ---
+    claims: dict[str, Any] = access_token.claims
+    google_user_data: dict[str, Any] = claims.get("google_user_data", {})
+    hd: str | None = google_user_data.get("hd")
+    email: str | None = claims.get("email")
+
+    if not email:
+        raise PermissionError("Google token does not contain an email claim.")
+
+    if hd != ALLOWED_DOMAIN:
+        raise PermissionError(
+            f"Access restricted to {ALLOWED_DOMAIN} accounts."
         )
-    ]
+    if not email.endswith(f"@{ALLOWED_DOMAIN}"):
+        raise PermissionError(
+            f"Access restricted to {ALLOWED_DOMAIN} accounts."
+        )
 
-
-@app.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    """Handle tool calls."""
+    # Exchange the raw Google access token for an ERP session token.
+    logger.debug("Exchanging Google token for ERP token (email=%s)", email)
+    google_token: str = access_token.token
     try:
-        if name == "authenticate_with_token":
-            result = await api_client.authenticate_with_token(
-                token=arguments["token"],
-                email=arguments.get("email")
-            )
-            return [TextContent(type="text", text=result)]
-
-        if name == "authenticate_with_google":
-            result = await api_client.authenticate_with_google(
-                access_token=arguments["access_token"],
-                email=arguments.get("email")
-            )
-            return [TextContent(type="text", text=result)]
-
-        if name == "authenticate_via_browser":
-            async def _exchange(access_token: str):
-                raw = await api_client.authenticate_with_google(access_token=access_token, email=None)
-                try:
-                    return json.loads(raw)
-                except json.JSONDecodeError:
-                    return {"status": "error", "message": raw or "Unknown error"}
-            err = await start_oauth_server(_exchange)
-            if err:
-                return [TextContent(type="text", text=json.dumps({
-                    "status": "error",
-                    "message": f"Could not start local sign-in server: {err}"
-                }, indent=2))]
-            login_url, warning = get_login_url()
-            msg = (
-                "Open this URL in your browser to sign in with Google. "
-                "After signing in you will be redirected back and can close the browser tab; then return to Cursor and use other tools.\n\n"
-                f"**Sign-in URL:** {login_url}"
-            )
-            if warning:
-                msg += f"\n\n**Note:** {warning}"
-            return [TextContent(type="text", text=msg)]
-
-        if name == "authenticate_via_erp_browser":
-            def _store_erp_token(token: str, email: Optional[str]) -> None:
-                auth_manager.set_current_token(token, email)
-
-            result = await _authenticate_via_erp_browser(_store_erp_token)
-            if result.get("status") == "success":
-                return [TextContent(type="text", text=json.dumps({
-                    "status": "success",
-                    "message": "Signed in via ERP browser. Token captured; you can use other tools now.",
-                    "email": result.get("email")
-                }, indent=2))]
-            if result.get("status") == "deployed":
-                msg = (
-                    result.get("message", "")
-                    + "\n\n**Open this URL in your browser:** "
-                    + result.get("url", "")
-                )
-                return [TextContent(type="text", text=json.dumps({
-                    "status": "deployed",
-                    "url": result.get("url"),
-                    "message": msg,
-                }, indent=2))]
-            return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
-        elif name == "get_week_logs":
-            result = await api_client.get_week_logs(
-                week_starting=arguments["week_starting"],
-                email=arguments.get("email")
-            )
-            return [TextContent(type="text", text=result)]
-
-        elif name == "get_day_logs":
-            result = await api_client.get_day_logs(
-                date=arguments["date"],
-                email=arguments.get("email")
-            )
-            return [TextContent(type="text", text=result)]
-
-        elif name == "get_logs_for_date_range":
-            result = await api_client.get_logs_for_date_range(
-                start_date=arguments["start_date"],
-                end_date=arguments["end_date"],
-                email=arguments.get("email")
-            )
-            return [TextContent(type="text", text=result)]
-
-        elif name == "create_or_update_log":
-            # Handle project_id or project_name
-            project_id = arguments.get("project_id")
-            project_name = arguments.get("project_name")
-            
-            # If project_name is provided, resolve project_id from it
-            if project_name:
-                active_projects_result = await api_client.get_active_projects(
-                    email=arguments.get("email")
-                )
-                active_projects_data = json.loads(active_projects_result)
-                if active_projects_data.get("status") == "success":
-                    active_projects = active_projects_data.get("data", [])
-                    # Search for project by name (case-insensitive, partial match)
-                    project_name_lower = project_name.lower().strip()
-                    found_project = None
-                    for proj in active_projects:
-                        if isinstance(proj, dict):
-                            team_name = proj.get("team", "")
-                            if team_name and project_name_lower in team_name.lower():
-                                found_project = proj
-                                break
-                    
-                    if found_project:
-                        project_id = found_project.get("id")
-                    else:
-                        available_projects = [p.get("team", "") for p in active_projects if isinstance(p, dict)]
-                        return [TextContent(type="text", text=json.dumps({
-                            "status": "error",
-                            "message": f"Project '{project_name}' not found in active projects. Available projects: {available_projects}"
-                        }, indent=2))]
-                else:
-                    return [TextContent(type="text", text=active_projects_result)]
-            
-            # If project_id is still a string (could be a name that wasn't found, or a string ID)
-            if project_id is None:
-                return [TextContent(type="text", text=json.dumps({
-                    "status": "error",
-                    "message": "Either project_id or project_name must be provided."
-                }, indent=2))]
-            
-            # Try to convert project_id to integer if it's a string
-            if isinstance(project_id, str):
-                # First check if it's a numeric string
-                try:
-                    project_id = int(project_id)
-                except ValueError:
-                    # If it's not numeric, treat it as a project name and search
-                    active_projects_result = await api_client.get_active_projects(
-                        email=arguments.get("email")
-                    )
-                    active_projects_data = json.loads(active_projects_result)
-                    if active_projects_data.get("status") == "success":
-                        active_projects = active_projects_data.get("data", [])
-                        project_name_lower = project_id.lower().strip()
-                        found_project = None
-                        for proj in active_projects:
-                            if isinstance(proj, dict):
-                                team_name = proj.get("team", "")
-                                if team_name and project_name_lower in team_name.lower():
-                                    found_project = proj
-                                    break
-                        
-                        if found_project:
-                            project_id = found_project.get("id")
-                        else:
-                            available_projects = [p.get("team", "") for p in active_projects if isinstance(p, dict)]
-                            return [TextContent(type="text", text=json.dumps({
-                                "status": "error",
-                                "message": f"Project '{project_id}' not found in active projects. Available projects: {available_projects}"
-                            }, indent=2))]
-                    else:
-                        return [TextContent(type="text", text=active_projects_result)]
-            
-            label_id = arguments.get("label_id")
-            label_name = arguments.get("label_name")
-            if label_name and not label_id:
-                labels_result = await api_client.get_log_labels(email=arguments.get("email"))
-                try:
-                    labels_data = json.loads(labels_result)
-                    if labels_data.get("status") == "success":
-                        labels = labels_data.get("data") or []
-                        name_lower = str(label_name).strip().lower()
-                        for lb in labels:
-                            if isinstance(lb, dict) and name_lower == (lb.get("name") or "").strip().lower():
-                                label_id = lb.get("id")
-                                break
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            if label_id is not None and isinstance(label_id, str):
-                try:
-                    label_id = int(label_id)
-                except ValueError:
-                    return [TextContent(type="text", text=json.dumps({
-                        "status": "error",
-                        "message": f"Invalid label_id: {label_id}. Must be an integer."
-                    }, indent=2))]
-            
-            # Ensure hours is a number
-            hours = arguments["hours"]
-            if isinstance(hours, str):
-                try:
-                    hours = float(hours)
-                except ValueError:
-                    return [TextContent(type="text", text=json.dumps({
-                        "status": "error",
-                        "message": f"Invalid hours: {hours}. Must be a number."
-                    }, indent=2))]
-            
-            result = await api_client.create_or_update_log(
-                date=arguments["date"],
-                project_id=project_id,
-                description=arguments["description"],
-                hours=hours,
-                email=arguments.get("email"),
-                label_id=label_id
-            )
-            return [TextContent(type="text", text=result)]
-
-        elif name == "delete_log":
-            project_id = arguments.get("project_id")
-            project_name = arguments.get("project_name")
-            if project_name:
-                active_projects_result = await api_client.get_active_projects(
-                    email=arguments.get("email")
-                )
-                active_projects_data = json.loads(active_projects_result)
-                if active_projects_data.get("status") == "success":
-                    active_projects = active_projects_data.get("data", [])
-                    project_name_lower = project_name.lower().strip()
-                    found_project = None
-                    for proj in active_projects:
-                        if isinstance(proj, dict):
-                            team_name = proj.get("team", "")
-                            if team_name and project_name_lower in team_name.lower():
-                                found_project = proj
-                                break
-                    if found_project:
-                        project_id = found_project.get("id")
-                    else:
-                        available_projects = [p.get("team", "") for p in active_projects if isinstance(p, dict)]
-                        return [TextContent(type="text", text=json.dumps({
-                            "status": "error",
-                            "message": f"Project '{project_name}' not found. Available: {available_projects}"
-                        }, indent=2))]
-                else:
-                    return [TextContent(type="text", text=active_projects_result)]
-            if project_id is None:
-                return [TextContent(type="text", text=json.dumps({
-                    "status": "error",
-                    "message": "Either project_id or project_name must be provided."
-                }, indent=2))]
-            if isinstance(project_id, str):
-                try:
-                    project_id = int(project_id)
-                except ValueError:
-                    return [TextContent(type="text", text=json.dumps({
-                        "status": "error",
-                        "message": f"Invalid project_id: {project_id}. Must be an integer or project name."
-                    }, indent=2))]
-            result = await api_client.delete_log(
-                date=arguments["date"],
-                project_id=project_id,
-                description=arguments["description"],
-                email=arguments.get("email")
-            )
-            return [TextContent(type="text", text=result)]
-
-        elif name == "complete_week_log":
-            result = await api_client.complete_week_log(
-                week_starting=arguments["week_starting"],
-                email=arguments.get("email"),
-                save_draft=arguments.get("save_draft", False)
-            )
-            return [TextContent(type="text", text=result)]
-
-        elif name == "get_active_projects":
-            result = await api_client.get_active_projects(
-                email=arguments.get("email")
-            )
-            return [TextContent(type="text", text=result)]
-
-        elif name == "check_person_week_project_exists":
-            # Handle project_id or project_name
-            project_id = arguments.get("project_id")
-            project_name = arguments.get("project_name")
-            
-            # If project_name is provided or project_id is a string, resolve project_id
-            if project_name or (project_id and isinstance(project_id, str) and not project_id.isdigit()):
-                active_projects_result = await api_client.get_active_projects(
-                    email=arguments.get("email")
-                )
-                active_projects_data = json.loads(active_projects_result)
-                if active_projects_data.get("status") == "success":
-                    active_projects = active_projects_data.get("data", [])
-                    search_name = project_name or project_id
-                    project_name_lower = search_name.lower().strip()
-                    found_project = None
-                    for proj in active_projects:
-                        if isinstance(proj, dict):
-                            team_name = proj.get("team", "")
-                            if team_name and project_name_lower in team_name.lower():
-                                found_project = proj
-                                break
-                    
-                    if found_project:
-                        project_id = found_project.get("id")
-                    else:
-                        available_projects = [p.get("team", "") for p in active_projects if isinstance(p, dict)]
-                        return [TextContent(type="text", text=json.dumps({
-                            "status": "error",
-                            "message": f"Project '{search_name}' not found in active projects. Available projects: {available_projects}"
-                        }, indent=2))]
-                else:
-                    return [TextContent(type="text", text=active_projects_result)]
-            
-            # Ensure project_id is an integer
-            if isinstance(project_id, str):
-                try:
-                    project_id = int(project_id)
-                except ValueError:
-                    return [TextContent(type="text", text=json.dumps({
-                        "status": "error",
-                        "message": f"Invalid project_id: {project_id}. Must be an integer or valid project name."
-                    }, indent=2))]
-            
-            result = await api_client.check_person_week_project_exists(
-                date=arguments["date"],
-                project_id=project_id,
-                email=arguments.get("email")
-            )
-            return [TextContent(type="text", text=result)]
-
-        elif name == "get_log_labels":
-            result = await api_client.get_log_labels(
-                email=arguments.get("email")
-            )
-            return [TextContent(type="text", text=result)]
-
-        elif name == "get_month_logs":
-            # Ensure year and month are integers
-            year = arguments["year"]
-            month = arguments["month"]
-            if isinstance(year, str):
-                try:
-                    year = int(year)
-                except ValueError:
-                    return [TextContent(type="text", text=json.dumps({
-                        "status": "error",
-                        "message": f"Invalid year: {year}. Must be an integer."
-                    }, indent=2))]
-            if isinstance(month, str):
-                try:
-                    month = int(month)
-                except ValueError:
-                    return [TextContent(type="text", text=json.dumps({
-                        "status": "error",
-                        "message": f"Invalid month: {month}. Must be an integer."
-                    }, indent=2))]
-            
-            result = await api_client.get_month_logs(
-                year=year,
-                month=month,
-                email=arguments.get("email")
-            )
-            return [TextContent(type="text", text=result)]
-
-        elif name == "fill_logs_for_days":
-            # Ensure project_id and label_id are integers
-            project_id = arguments["project_id"]
-            if isinstance(project_id, str):
-                try:
-                    project_id = int(project_id)
-                except ValueError:
-                    return [TextContent(type="text", text=json.dumps({
-                        "status": "error",
-                        "message": f"Invalid project_id: {project_id}. Must be an integer."
-                    }, indent=2))]
-            
-            label_id = arguments.get("label_id")
-            if label_id is not None and isinstance(label_id, str):
-                try:
-                    label_id = int(label_id)
-                except ValueError:
-                    return [TextContent(type="text", text=json.dumps({
-                        "status": "error",
-                        "message": f"Invalid label_id: {label_id}. Must be an integer."
-                    }, indent=2))]
-            
-            # Ensure hours_per_day is a number
-            hours_per_day = arguments.get("hours_per_day", 8)
-            if isinstance(hours_per_day, str):
-                try:
-                    hours_per_day = float(hours_per_day)
-                except ValueError:
-                    return [TextContent(type="text", text=json.dumps({
-                        "status": "error",
-                        "message": f"Invalid hours_per_day: {hours_per_day}. Must be a number."
-                    }, indent=2))]
-            
-            result = await api_client.fill_logs_for_days(
-                start_date=arguments["start_date"],
-                end_date=arguments["end_date"],
-                project_id=project_id,
-                description=arguments["description"],
-                email=arguments.get("email"),
-                hours_per_day=hours_per_day,
-                label_id=label_id,
-                skip_weekends=arguments.get("skip_weekends", False)
-            )
-            return [TextContent(type="text", text=result)]
-
-        else:
-            return [TextContent(
-                type="text",
-                text=f"Unknown tool: {name}"
-            )]
-
-    except Exception as e:
-        import traceback
-        error_traceback = traceback.format_exc()
-        error_msg = f"Error executing tool {name}: {str(e)}\n\nTraceback:\n{error_traceback}"
-        return [TextContent(type="text", text=error_msg)]
+        erp_token, verified_email = await _get_erp().exchange_google_token(google_token)
+    except ConnectionError as exc:
+        logger.warning("ERP token exchange failed: connection error")
+        raise PermissionError(
+            "ERP service is temporarily unavailable. Please try again later."
+        ) from exc
+    logger.debug("ERP token exchange successful for %s", verified_email)
+    return erp_token, verified_email
 
 
-async def main():
-    """Run the MCP server."""
+# ---------------------------------------------------------------------------
+# Read tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+@_tool_error_handler("Failed to fetch active projects. Please try again.")
+async def get_active_projects() -> dict[str, Any]:
+    """Get list of active projects/subteams for the authenticated user."""
+    token, _email = await _get_erp_token()
+    return _check_erp_result(await _get_erp().get_active_projects(token))
+
+
+@mcp.tool
+@_tool_error_handler("Failed to fetch log labels. Please try again.")
+async def get_log_labels() -> dict[str, Any]:
+    """Get available log labels for categorizing log entries."""
+    token, _email = await _get_erp_token()
+    return _check_erp_result(await _get_erp().get_log_labels(token))
+
+
+@mcp.tool
+@_tool_error_handler("Failed to fetch week logs. Please try again.")
+async def get_week_logs(week_starting: str) -> dict[str, Any]:
+    """Get project logs for a specific week.
+
+    Args:
+        week_starting: Week starting date in YYYY-MM-DD format (must be a Monday).
+    """
+    d = date_type.fromisoformat(week_starting)
+    if d.weekday() != 0:
+        raise ToolError(
+            f"week_starting must be a Monday, got {week_starting} ({d.strftime('%A')})"
+        )
+    token, _email = await _get_erp_token()
+    return _check_erp_result(await _get_erp().get_week_logs(token, week_starting))
+
+
+@mcp.tool
+@_tool_error_handler("Failed to fetch day logs. Please try again.")
+async def get_day_logs(date_str: str) -> dict[str, Any]:
+    """Get detailed project logs for a specific day.
+
+    Returns all projects, tasks, and time logged for that day.
+
+    Args:
+        date_str: Date in YYYY-MM-DD format.
+    """
+    token, _email = await _get_erp_token()
+    return _check_erp_result(await _get_erp().get_day_logs(token, date_str))
+
+
+@mcp.tool
+@_tool_error_handler("Failed to fetch logs for date range. Please try again.")
+async def get_logs_for_date_range(
+    start_date: str,
+    end_date: str,
+) -> dict[str, Any]:
+    """Get project logs for a date range.
+
+    Args:
+        start_date: Start date in YYYY-MM-DD format.
+        end_date: End date in YYYY-MM-DD format.
+    """
+    # Validate and cap date range
     try:
-        async with stdio_server() as (read_stream, write_stream):
-            await app.run(
-                read_stream,
-                write_stream,
-                app.create_initialization_options()
-            )
-    except KeyboardInterrupt:
-        # Gracefully handle Ctrl+C
-        pass
-    except Exception as e:
-        # Log any unexpected errors but don't crash
-        # The MCP SDK should handle JSON parsing errors, but just in case
-        import sys
-        print(f"Server error: {e}", file=sys.stderr)
-        sys.exit(1)
+        start = date_type.fromisoformat(start_date)
+        end = date_type.fromisoformat(end_date)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid date format. Use YYYY-MM-DD. Details: {exc}"
+        ) from exc
+    if end < start:
+        raise ValueError("end_date must be on or after start_date.")
+    day_span = (end - start).days + 1
+    if day_span > _MAX_QUERY_DAYS:
+        raise ValueError(
+            f"Date range spans {day_span} days, exceeding the maximum of "
+            f"{_MAX_QUERY_DAYS} days for read queries."
+        )
 
+    token, _email = await _get_erp_token()
+    return _check_erp_result(
+        await _get_erp().get_logs_for_date_range(token, start_date, end_date)
+    )
+
+
+@mcp.tool
+@_tool_error_handler("Failed to fetch month logs. Please try again.")
+async def get_month_logs(year: int, month: int) -> dict[str, Any]:
+    """Get all project logs for a specific month and year.
+
+    Args:
+        year: Year (e.g. 2024).
+        month: Month number (1-12).
+    """
+    token, _email = await _get_erp_token()
+    return _check_erp_result(await _get_erp().get_month_logs(token, year, month))
+
+
+# ---------------------------------------------------------------------------
+# Write tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+@_tool_error_handler("Failed to create or update log. Please try again.")
+async def create_or_update_log(
+    date: str,
+    description: str,
+    hours: float,
+    project_id: int | None = None,
+    project_name: str | None = None,
+    label_id: int | None = None,
+    label_name: str | None = None,
+) -> dict[str, Any]:
+    """Add or update a time log entry for a date.
+
+    Specify the project by ID or name (one is required). Optionally categorize
+    with a label by ID or name.
+
+    Args:
+        date: Date in YYYY-MM-DD format.
+        description: Description of work done.
+        hours: Hours worked (decimal allowed, e.g. 2 or 8.5, 0-24).
+        project_id: Project/subteam ID (from get_active_projects). Use this or project_name.
+        project_name: Project/team name (e.g. 'Your Project Name'). Resolved automatically.
+        label_id: Label ID (from get_log_labels). Use this or label_name.
+        label_name: Label name (e.g. 'Coding'). Resolved automatically.
+    """
+    if project_id is not None and project_name is not None:
+        raise ToolError("Provide either project_id or project_name, not both.")
+    if len(description) > _MAX_DESCRIPTION_LEN:
+        raise ToolError(f"Description too long (max {_MAX_DESCRIPTION_LEN} characters)")
+    if hours <= 0 or hours > 24:
+        raise ValueError(
+            f"hours must be between 0 (exclusive) and 24 (inclusive), got {hours}"
+        )
+    if round(hours * 60) < 1:
+        raise ToolError("Hours too small: rounds to 0 minutes. Minimum is ~0.02 (1 minute).")
+    token, email = await _get_erp_token()
+    client = _get_erp()
+    resolved_project_id = await client.resolve_project_id(token, project_id, project_name)
+    resolved_label_id = await client.resolve_label_id(token, label_id, label_name)
+    result = _check_erp_result(
+        await client.create_or_update_log(
+            token,
+            date_str=date,
+            project_id=resolved_project_id,
+            description=description,
+            hours=hours,
+            label_id=resolved_label_id,
+        )
+    )
+    logger.info(
+        "WRITE_OP tool=create_or_update_log user=%s date=%s project_id=%s hours=%s",
+        email, date, resolved_project_id, hours,
+    )
+    return result
+
+
+@mcp.tool
+@_tool_error_handler("Failed to delete log. Please try again.")
+async def delete_log(
+    date: str,
+    description: str,
+    project_id: int | None = None,
+    project_name: str | None = None,
+) -> dict[str, Any]:
+    """Remove a time log entry for a date.
+
+    Specify the project by ID or name (one is required) and provide the exact
+    task description of the entry to delete.
+
+    Args:
+        date: Date in YYYY-MM-DD format.
+        description: Exact task description of the log entry to remove.
+        project_id: Project/subteam ID (from get_active_projects). Use this or project_name.
+        project_name: Project/team name. Resolved automatically.
+    """
+    if project_id is not None and project_name is not None:
+        raise ToolError("Provide either project_id or project_name, not both.")
+    if len(description) > _MAX_DESCRIPTION_LEN:
+        raise ToolError(f"Description too long (max {_MAX_DESCRIPTION_LEN} characters)")
+    token, email = await _get_erp_token()
+    client = _get_erp()
+    resolved_project_id = await client.resolve_project_id(token, project_id, project_name)
+    result = _check_erp_result(
+        await client.delete_log(
+            token,
+            date_str=date,
+            project_id=resolved_project_id,
+            description=description,
+        )
+    )
+    logger.info(
+        "WRITE_OP tool=delete_log user=%s date=%s project_id=%s",
+        email, date, resolved_project_id,
+    )
+    return result
+
+
+@mcp.tool
+@_tool_error_handler("Failed to complete week log. Please try again.")
+async def complete_week_log(
+    week_starting: str,
+    save_draft: bool = False,
+) -> dict[str, Any]:
+    """Mark a week's project logs as completed (or save as draft).
+
+    Args:
+        week_starting: Week starting date in YYYY-MM-DD format (must be a Monday).
+        save_draft: If true, saves as draft without completing. Default is false.
+    """
+    d = date_type.fromisoformat(week_starting)
+    if d.weekday() != 0:
+        raise ToolError(
+            f"week_starting must be a Monday, got {week_starting} ({d.strftime('%A')})"
+        )
+    token, email = await _get_erp_token()
+    result = _check_erp_result(
+        await _get_erp().complete_week_log(token, week_starting, save_draft=save_draft)
+    )
+    logger.info(
+        "WRITE_OP tool=complete_week_log user=%s week_starting=%s save_draft=%s",
+        email, week_starting, save_draft,
+    )
+    return result
+
+
+@mcp.tool
+@_tool_error_handler("Failed to fill logs for days. Please try again.")
+async def fill_logs_for_days(
+    start_date: str,
+    end_date: str,
+    description: str,
+    hours_per_day: float = 8.0,
+    project_id: int | None = None,
+    project_name: str | None = None,
+    label_id: int | None = None,
+    label_name: str | None = None,
+    skip_weekends: bool = False,
+) -> dict[str, Any]:
+    """Fill time logs for multiple days at once (bulk operation).
+
+    Specify the project by ID or name (one is required). Optionally set a label.
+    The date range is capped at 31 days for safety.
+
+    Args:
+        start_date: Start date in YYYY-MM-DD format.
+        end_date: End date in YYYY-MM-DD format.
+        description: Description of the work done.
+        hours_per_day: Hours to log per day (default 8).
+        project_id: Project/subteam ID. Use this or project_name.
+        project_name: Project/team name. Resolved automatically.
+        label_id: Label ID. Use this or label_name.
+        label_name: Label name. Resolved automatically.
+        skip_weekends: Skip Saturday and Sunday. Default is false.
+    """
+    if project_id is not None and project_name is not None:
+        raise ToolError("Provide either project_id or project_name, not both.")
+    if len(description) > _MAX_DESCRIPTION_LEN:
+        raise ToolError(f"Description too long (max {_MAX_DESCRIPTION_LEN} characters)")
+    if hours_per_day <= 0 or hours_per_day > 24:
+        raise ValueError(
+            f"hours_per_day must be between 0 (exclusive) and 24 (inclusive), "
+            f"got {hours_per_day}"
+        )
+    if round(hours_per_day * 60) < 1:
+        raise ToolError("Hours too small: rounds to 0 minutes. Minimum is ~0.02 (1 minute).")
+    # --- SEC-05: 31-day cap ---
+    try:
+        start = date_type.fromisoformat(start_date)
+        end = date_type.fromisoformat(end_date)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid date format. Use YYYY-MM-DD. Details: {exc}"
+        ) from exc
+
+    day_count = (end - start).days + 1
+    if day_count > _MAX_FILL_DAYS:
+        raise ValueError(
+            f"Date range spans {day_count} days, exceeding the maximum of "
+            f"{_MAX_FILL_DAYS} days. Please use a shorter range."
+        )
+    if day_count < 1:
+        raise ValueError("end_date must be on or after start_date.")
+
+    token, email = await _get_erp_token()
+    client = _get_erp()
+    resolved_project_id = await client.resolve_project_id(token, project_id, project_name)
+    resolved_label_id = await client.resolve_label_id(token, label_id, label_name)
+    result = _check_erp_result(
+        await client.fill_logs_for_days(
+            token,
+            start_date=start_date,
+            end_date=end_date,
+            project_id=resolved_project_id,
+            description=description,
+            hours_per_day=hours_per_day,
+            label_id=resolved_label_id,
+            skip_weekends=skip_weekends,
+        )
+    )
+    logger.info(
+        "WRITE_OP tool=fill_logs_for_days user=%s start=%s end=%s project_id=%s days=%s",
+        email, start_date, end_date, resolved_project_id, day_count,
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+@_tool_error_handler("Failed to check PersonWeekProject existence. Please try again.")
+async def check_person_week_project_exists(
+    date: str,
+    project_id: int | None = None,
+    project_name: str | None = None,
+) -> dict[str, Any]:
+    """Check if a PersonWeekProject exists for a given date and project.
+
+    PersonWeekProject is required before adding logs. It links PersonWeekLog
+    (for the week) and PersonTeam (linking person to subteam). Returns what
+    is needed if it does not exist.
+
+    Args:
+        date: Date in YYYY-MM-DD format.
+        project_id: Project/subteam ID. Use this or project_name.
+        project_name: Project/team name. Resolved automatically.
+    """
+    if project_id is not None and project_name is not None:
+        raise ToolError("Provide either project_id or project_name, not both.")
+    token, _email = await _get_erp_token()
+    client = _get_erp()
+    resolved_project_id = await client.resolve_project_id(token, project_id, project_name)
+    return _check_erp_result(
+        await client.check_person_week_project_exists(
+            token, date, resolved_project_id
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Check if running in interactive mode (not recommended)
-    if sys.stdin.isatty():
-        print(
-            "Warning: MCP server should be run by an MCP client, not directly in terminal.\n"
-            "If you're testing, use an MCP client like Claude Desktop.\n"
-            "Do not type in this terminal - all input is treated as JSON-RPC messages.\n",
-            file=sys.stderr
+    if not ALLOWED_DOMAIN:
+        logger.critical("ALLOWED_DOMAIN must not be empty")
+        raise SystemExit(1)
+    if not _google_client_id or not _google_client_secret:
+        raise SystemExit(
+            "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET environment variables are required."
         )
-    
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        # Handle Ctrl+C gracefully
-        pass
+    mcp.run(
+        transport="http",
+        host=os.environ.get("MCP_HOST", "127.0.0.1"),
+        port=int(os.environ.get("MCP_PORT", "8100")),
+        stateless_http=True,
+        middleware=[_security_middleware],
+    )
