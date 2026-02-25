@@ -5,222 +5,421 @@ This guide walks you through adding new MCP tools that expose ERP API functional
 ## Architecture Overview
 
 ```
-server.py        MCP tool definitions, OAuth, input validation, audit logging
-erp_client.py    ERPClient — HTTP calls to ERP API via _request() helper
+server.py           FastMCP instance, GoogleProvider auth, middleware, health check, lifespan
+_auth.py            Auth helpers — get_erp_token(), tool_error_handler(), check_erp_result()
+_constants.py       Shared constants — MAX_FILL_DAYS, MAX_QUERY_DAYS, MAX_DESCRIPTION_LEN, etc.
+clients/
+  __init__.py       ERPClientRegistry (dataclass), get_registry(), set_registry()
+  _base.py          BaseERPClient + TTLCache — HTTP transport, token exchange, static helpers
+  timelogs.py       TimelogsClient — composition over inheritance, delegates to BaseERPClient._request()
+tools/
+  __init__.py       Feature flag loader — AVAILABLE_DOMAINS, SENSITIVE_DOMAINS, load_domains(mcp)
+  timelogs.py       11 timelog tools inside register(mcp) pattern
 tests/
-  conftest.py    Sets env vars before module imports
-  test_server.py      Server tool tests (mocked ERPClient)
-  test_erp_client.py  ERPClient tests (respx-mocked HTTP)
+  conftest.py                Sets env vars before module imports
+  test_security.py           AST-based security tests (auto-discovers @mcp.tool across tools/*.py)
+  test_feature_flags.py      Feature flag loader tests
+  test_clients_base.py       BaseERPClient + TTLCache tests (respx-mocked HTTP)
+  test_clients_timelogs.py   TimelogsClient tests (respx-mocked HTTP)
+  test_tools_timelogs.py     Timelog tool tests (mocked registry + token)
 ```
 
 **Data flow for every tool call:**
 
 ```
 Client (Claude/Cursor/etc.)
-  → FastMCP (@mcp.tool function in server.py)
-    → _get_erp_token() extracts Google token, enforces domain, exchanges for ERP token
-    → ERPClient method (erp_client.py) makes HTTP call to ERP API
-    → _check_erp_result() converts error dicts to ToolError
-  → Response returned to client
+  -> FastMCP (@mcp.tool closure in tools/{domain}.py)
+    -> get_erp_token() extracts Google token, enforces domain, exchanges for ERP token
+    -> get_registry().{domain}.{method}() makes HTTP call to ERP API via BaseERPClient._request()
+    -> check_erp_result() converts error dicts to ToolError
+  -> Response returned to client
 ```
 
-## Adding a Read Tool
+## Adding a New Domain
 
-Read tools fetch data from the ERP API. Touch **4 files** (2 source + 2 test).
+A "domain" is a vertical feature area (e.g., `timelogs`, `payroll`, `invoices`). Adding one touches **6 files** plus tests.
 
-### Step 1: Add ERPClient method (`erp_client.py`)
+### Step 1: Create the domain client (`clients/payroll.py`)
 
-Simple GET methods are one-liners that delegate to `_request()`:
+Use composition -- hold a reference to `BaseERPClient` for HTTP transport:
 
 ```python
-async def get_user_profile(self, token: str) -> dict[str, Any]:
-    """Fetch the authenticated user's profile."""
-    return await self._request("GET", "project-logs/person/profile/", token)
+"""Domain client for ERP payroll operations."""
+from __future__ import annotations
+
+from typing import Any
+
+from clients._base import BaseERPClient
+
+__all__ = ["PayrollClient"]
+
+
+class PayrollClient:
+    """High-level operations on ERP payroll data.
+
+    All public methods take ``token: str`` as the first argument (SEC-01).
+    """
+
+    def __init__(self, base: BaseERPClient) -> None:
+        self._base = base
+
+    async def get_payslips(self, token: str, year: int, month: int) -> dict[str, Any]:
+        return await self._base._request(
+            "GET", "payroll/payslips/", token, params={"year": year, "month": month}
+        )
 ```
 
-For methods with query parameters:
+**Rules:**
+- First parameter is always `token: str`
+- Return type is always `dict[str, Any]`
+- Delegate all HTTP I/O to `self._base._request()` -- never create your own `httpx` client
+- Use `BaseERPClient` static helpers (e.g., `_parse_abbreviated_date()`) when needed
+
+### Step 2: Register the client in the registry (`clients/__init__.py`)
+
+Add a field to `ERPClientRegistry` and wire it up in `__post_init__`:
+
+```python
+from clients.payroll import PayrollClient
+
+@dataclass
+class ERPClientRegistry:
+    base: BaseERPClient
+    timelogs: TimelogsClient = field(init=False)
+    payroll: PayrollClient = field(init=False)       # <-- add
+
+    def __post_init__(self) -> None:
+        self.timelogs = TimelogsClient(self.base)
+        self.payroll = PayrollClient(self.base)      # <-- add
+```
+
+### Step 3: Create the tools module (`tools/payroll.py`)
+
+Each domain gets a `register(mcp)` function containing `@mcp.tool` closures:
+
+```python
+"""Payroll MCP tools — payslip and compensation operations."""
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from fastmcp import FastMCP
+
+from _auth import check_erp_result, get_erp_token, tool_error_handler
+from clients import get_registry
+
+logger = logging.getLogger("erp_mcp.server")
+
+__all__ = ["register"]
+
+
+def register(mcp: FastMCP) -> None:
+    """Register all payroll tools on the given FastMCP instance."""
+
+    @mcp.tool
+    @tool_error_handler("Failed to fetch payslips. Please try again.")
+    async def payroll_list_payslips(year: int, month: int) -> dict[str, Any]:
+        """Get payslips for a specific month.
+
+        Args:
+            year: Year (e.g. 2024).
+            month: Month number (1-12).
+        """
+        token, _email = await get_erp_token()
+        return check_erp_result(
+            await get_registry().payroll.get_payslips(token, year, month)
+        )
+```
+
+### Step 4: Register the domain in the feature flag loader (`tools/__init__.py`)
+
+```python
+AVAILABLE_DOMAINS: dict[str, str] = {
+    "timelogs": "tools.timelogs",
+    "payroll": "tools.payroll",       # <-- add
+}
+```
+
+If the domain handles PII or financial data, also add it to `SENSITIVE_DOMAINS` (SEC-08):
+
+```python
+SENSITIVE_DOMAINS: frozenset[str] = frozenset({"payroll", "invoices"})
+```
+
+Sensitive domains require `ENABLE_SENSITIVE_DOMAINS=true` at runtime. Without it, the server exits on startup.
+
+### Step 5: Update the Dockerfile
+
+The Dockerfile copies `clients/` and `tools/` as directories, so new files inside them are picked up automatically. Only update the Dockerfile if you add a new **top-level** `.py` file outside those directories:
+
+```dockerfile
+# Top-level files must be listed explicitly:
+COPY --chown=root:root --chmod=644 server.py _auth.py _constants.py ./
+# Directories are copied whole:
+COPY --chown=root:root --chmod=644 clients/ ./clients/
+COPY --chown=root:root --chmod=644 tools/ ./tools/
+```
+
+### Step 6: Create test files
+
+Create `tests/test_clients_payroll.py` (HTTP-level) and `tests/test_tools_payroll.py` (tool-level). See [Test Patterns](#test-patterns) below.
+
+## Adding a Read Tool to an Existing Domain
+
+Touch **4 files** (2 source + 2 test).
+
+### Step 1: Add client method (`clients/timelogs.py`)
 
 ```python
 async def get_team_members(self, token: str, team_id: int) -> dict[str, Any]:
-    return await self._request(
+    """Fetch team members for a project."""
+    return await self._base._request(
         "GET", "project-logs/team/members/", token, params={"team_id": team_id}
     )
 ```
 
-**Key rules:**
-- First parameter is always `token: str`
-- Return type is always `dict[str, Any]`
-- `_request()` handles auth headers, error responses, and JSON parsing
-- Endpoint strings are relative to `ERP_API_BASE_URL` (e.g. `project-logs/person/...`)
+### Step 2: Add tool closure (`tools/timelogs.py`)
 
-### Step 2: Add MCP tool function (`server.py`)
-
-Add to the "Read tools" section:
+Add inside the existing `register(mcp)` function:
 
 ```python
 @mcp.tool
-@_tool_error_handler("Failed to fetch user profile. Please try again.")
-async def get_user_profile() -> dict[str, Any]:
-    """Get the authenticated user's ERP profile.
+@tool_error_handler("Failed to fetch team members. Please try again.")
+async def timelogs_list_team_members(team_id: int) -> dict[str, Any]:
+    """Get team members for a project.
 
-    Returns profile information including name, team assignments, and role.
+    Args:
+        team_id: Project/subteam ID (from timelogs_list_projects).
     """
-    token, _email = await _get_erp_token()
-    return _check_erp_result(await _get_erp().get_user_profile(token))
+    token, _email = await get_erp_token()
+    return check_erp_result(
+        await get_registry().timelogs.get_team_members(token, team_id)
+    )
 ```
 
-**Pattern breakdown:**
-- `@mcp.tool` — registers the function as an MCP tool (the docstring becomes the tool description shown to AI clients)
-- `@_tool_error_handler("...")` — catches exceptions, converts to `ToolError` with generic message (SEC-04: no stack traces leak to clients)
-- `await _get_erp_token()` — extracts Google token from request context, enforces domain check (SEC-02), exchanges for ERP token
-- `_check_erp_result(...)` — converts `{"status": "error", "message": "..."}` dicts from ERPClient into `ToolError`
-- `_get_erp()` — returns the ERPClient singleton (raises `RuntimeError` if server hasn't started)
-
-**Tool parameters:**
-- No `email` parameter — identity comes from the OAuth token (SEC-01)
-- Use type hints for all parameters — FastMCP uses them to generate the tool schema
-- Add an `Args:` section to the docstring for each parameter
-
-### Step 3: Add server tests (`tests/test_server.py`)
-
-Create a test class following the existing pattern:
-
-```python
-class TestGetUserProfile:
-    async def test_calls_erp_client(
-        self, mock_erp: AsyncMock, valid_token: AccessToken
-    ) -> None:
-        from server import get_user_profile
-
-        with _patch_token(valid_token), _patch_erp(mock_erp):
-            result = await get_user_profile()
-
-        assert result["status"] == "success"
-        mock_erp.get_user_profile.assert_awaited_once_with("erp-token-abc")
-
-    async def test_unexpected_error_raises_tool_error(
-        self, mock_erp: AsyncMock, valid_token: AccessToken
-    ) -> None:
-        from server import get_user_profile
-
-        mock_erp.get_user_profile.side_effect = RuntimeError("DB down")
-        with _patch_token(valid_token), _patch_erp(mock_erp):
-            with pytest.raises(ToolError, match="Failed to fetch user profile"):
-                await get_user_profile()
-```
-
-**Important:** Update the `mock_erp` fixture to include a return value for your new method:
-
-```python
-client.get_user_profile.return_value = {"status": "success", "data": {"name": "Test"}}
-```
-
-If you forget this, the `AsyncMock` silently returns another mock instead of a dict, and your `_check_erp_result` call won't catch it.
-
-### Step 4: Add client tests (`tests/test_erp_client.py`)
-
-Use `respx` to mock the HTTP endpoint:
+### Step 3: Add client test (`tests/test_clients_timelogs.py`)
 
 ```python
 @respx.mock
-async def test_get_user_profile(client: ERPClient) -> None:
-    respx.get(f"{BASE_URL}/project-logs/person/profile/").mock(
-        return_value=httpx.Response(200, json={"id": 1, "name": "Test User"})
+async def test_get_team_members(self, timelogs_client: TimelogsClient) -> None:
+    respx.get(f"{BASE_URL}/project-logs/team/members/").mock(
+        return_value=httpx.Response(200, json=[{"id": 1, "name": "Alice"}])
     )
-    result = await client.get_user_profile(token="tok")
+    result = await timelogs_client.get_team_members(token="tok", team_id=42)
     assert result["status"] == "success"
-    assert result["data"]["name"] == "Test User"
+    assert result["data"][0]["name"] == "Alice"
 ```
+
+### Step 4: Add tool test (`tests/test_tools_timelogs.py`)
+
+```python
+class TestTimelogsListTeamMembers:
+    async def test_calls_client(
+        self, mock_timelogs: AsyncMock, mock_registry: AsyncMock, valid_token: AccessToken
+    ) -> None:
+        mock_timelogs.get_team_members.return_value = {"status": "success", "data": []}
+        set_registry(mock_registry)
+        fn = _get_tool_fn("timelogs_list_team_members")
+        with _patch_token(valid_token):
+            result = await fn(team_id=42)
+        assert result["status"] == "success"
+        mock_timelogs.get_team_members.assert_awaited_once_with("erp-token-abc", 42)
+```
+
+**Important:** Update the `mock_timelogs` fixture with a return value for your new method. Without this, `AsyncMock` returns another mock instead of a dict, and `check_erp_result()` silently passes.
 
 ## Adding a Write Tool
 
-Write tools modify data. They require **additional steps** beyond read tools.
+Same steps as a read tool, **plus** three additional requirements:
 
-### Extra requirements for write tools
+### 1. Audit logging
 
-**1. Audit logging** — Emit a structured log line after every successful write:
+Emit a structured `WRITE_OP` log line after every successful write:
 
 ```python
+result = check_erp_result(await client.some_write(token, ...))
 logger.info(
-    "WRITE_OP tool=your_tool_name user=%s param1=%s param2=%s",
+    "WRITE_OP tool=payroll_update_entry user=%s param1=%s param2=%s",
     email, param1, param2,
 )
+return result
 ```
 
-Use `token, email = await _get_erp_token()` (not `_email`) to capture the email for the log.
+Use `token, email = await get_erp_token()` (not `_email`) to capture the email for the log.
 
-**2. Input validation** — Validate user inputs before calling ERPClient:
+### 2. Input validation
+
+Validate before calling the client:
 
 ```python
 # Description length
-if len(description) > _MAX_DESCRIPTION_LEN:
-    raise ToolError(f"Description too long (max {_MAX_DESCRIPTION_LEN} characters)")
+if len(description) > MAX_DESCRIPTION_LEN:
+    raise ToolError(f"Description too long (max {MAX_DESCRIPTION_LEN} characters)")
 
 # Hours bounds
 if hours <= 0 or hours > 24:
     raise ValueError(f"hours must be between 0 (exclusive) and 24 (inclusive), got {hours}")
 
 # Date range cap (SEC-05)
-if day_count > _MAX_FILL_DAYS:
-    raise ValueError(f"Date range spans {day_count} days, exceeding the maximum of {_MAX_FILL_DAYS} days.")
+if day_count > MAX_FILL_DAYS:
+    raise ValueError(f"Date range spans {day_count} days, exceeding the maximum of {MAX_FILL_DAYS} days.")
 ```
 
-**3. Project/label resolution** — If the tool accepts a project or label, offer both ID and name:
+Constants are defined in `_constants.py`.
 
-```python
-async def your_write_tool(
-    # ... other params ...
-    project_id: int | None = None,
-    project_name: str | None = None,
-    label_id: int | None = None,
-    label_name: str | None = None,
-) -> dict[str, Any]:
-    # ...
-    client = _get_erp()
-    resolved_project_id = await client.resolve_project_id(token, project_id, project_name)
-    resolved_label_id = await client.resolve_label_id(token, label_id, label_name)
-```
+### 3. Audit log test coverage
 
-**4. Audit log test** — Add your tool to `TestAuditLogCoverage.WRITE_TOOLS`:
+Add your tool to `TestAuditLogCoverage.WRITE_TOOLS` in the tool test file:
 
 ```python
 WRITE_TOOLS = [
     # ... existing entries ...
-    ("your_tool_name", {"param1": "value1", "param2": "value2"}),
+    ("payroll_update_entry", {"param1": "value1", "param2": "value2"}),
 ]
 ```
 
-The guard test `test_all_write_tools_covered` will fail if you add a `WRITE_OP` log line but forget to add the tool to this list.
+The guard test `test_all_write_tools_covered` auto-discovers `WRITE_OP` strings in `tools/*.py` via AST and will fail if your tool is missing from this list.
 
-### Complete write tool example
+## Tool Naming Convention
+
+All tools follow the pattern: **`{domain}_{verb}_{resource}`**
+
+Standard verbs: `list`, `get`, `upsert`, `delete`, `complete`, `fill`, `check`
+
+The `test_security.py::TestToolNamingConvention` test enforces that every tool in `tools/{domain}.py` starts with `{domain}_`. Adding a tool named `get_payslips` in `tools/payroll.py` will fail the test -- it must be `payroll_get_payslips`.
+
+## Tool Decorator Pattern
+
+Every tool inside `register(mcp)` follows this exact stack:
 
 ```python
 @mcp.tool
-@_tool_error_handler("Failed to archive project log. Please try again.")
-async def archive_project_log(
-    date: str,
-    project_id: int | None = None,
-    project_name: str | None = None,
-) -> dict[str, Any]:
-    """Archive a project log entry for a specific date.
+@tool_error_handler("Generic error message.")
+async def domain_verb_resource(...) -> dict[str, Any]:
+    """Docstring becomes the tool description shown to AI clients.
 
     Args:
-        date: Date in YYYY-MM-DD format.
-        project_id: Project/subteam ID. Use this or project_name.
-        project_name: Project/team name. Resolved automatically.
+        param: Description for AI clients.
     """
-    token, email = await _get_erp_token()
-    client = _get_erp()
-    resolved_project_id = await client.resolve_project_id(token, project_id, project_name)
-    result = _check_erp_result(
-        await client.archive_project_log(token, date_str=date, project_id=resolved_project_id)
+    token, email = await get_erp_token()         # SEC-01/02: identity from OAuth only
+    return check_erp_result(                       # error dict -> ToolError
+        await get_registry().domain.method(token, ...)
     )
-    logger.info(
-        "WRITE_OP tool=archive_project_log user=%s date=%s project_id=%s",
-        email, date, resolved_project_id,
-    )
-    return result
 ```
+
+- `@mcp.tool` -- registers the function as an MCP tool
+- `@tool_error_handler("...")` -- catches exceptions, converts to `ToolError` with generic message (SEC-04)
+- `get_erp_token()` -- extracts Google token, enforces domain check (SEC-02), exchanges for ERP token
+- `check_erp_result()` -- converts `{"status": "error", ...}` dicts to `ToolError`
+- `get_registry()` -- returns `ERPClientRegistry` (raises `RuntimeError` if lifespan hasn't run)
+
+**Tool parameters:**
+- No `email` parameter -- identity comes from the OAuth token (SEC-01)
+- Use type hints for all parameters -- FastMCP uses them to generate the tool schema
+- Add an `Args:` section to the docstring for each parameter
+
+## Test Patterns
+
+### Tool tests (`tests/test_tools_{domain}.py`)
+
+Tool tests mock the entire client layer and the OAuth token, testing only the tool function logic:
+
+```python
+# Retrieve the registered tool function by name
+fn = _get_tool_fn("timelogs_list_projects")
+
+# _get_tool_fn looks up the function in mcp.local_provider._components
+```
+
+**Key fixtures and helpers:**
+
+| Name | Purpose |
+|------|---------|
+| `_get_tool_fn(name)` | Retrieves tool function from `mcp.local_provider._components` |
+| `_make_access_token()` | Builds a fake `AccessToken` with GoogleProvider claims structure |
+| `_patch_token(token)` | Patches `_auth.get_access_token` to return a fake token |
+| `mock_timelogs` | `AsyncMock` with return values for every `TimelogsClient` method |
+| `mock_registry` | `AsyncMock` wrapping `mock_timelogs` + mocked `base.exchange_google_token` |
+| `set_registry(mock_registry)` | Injects mock registry into the global slot |
+
+**Pattern for each test class:**
+
+```python
+class TestTimelogsListProjects:
+    async def test_calls_client(
+        self, mock_timelogs: AsyncMock, mock_registry: AsyncMock, valid_token: AccessToken
+    ) -> None:
+        set_registry(mock_registry)
+        fn = _get_tool_fn("timelogs_list_projects")
+        with _patch_token(valid_token):
+            result = await fn()
+        assert result["status"] == "success"
+        mock_timelogs.get_active_projects.assert_awaited_once_with("erp-token-abc")
+
+    async def test_unexpected_error_raises_tool_error(
+        self, mock_timelogs: AsyncMock, mock_registry: AsyncMock, valid_token: AccessToken
+    ) -> None:
+        mock_timelogs.get_active_projects.side_effect = RuntimeError("DB down")
+        set_registry(mock_registry)
+        fn = _get_tool_fn("timelogs_list_projects")
+        with _patch_token(valid_token):
+            with pytest.raises(ToolError, match="Failed to fetch active projects"):
+                await fn()
+```
+
+### Client HTTP tests (`tests/test_clients_{domain}.py`)
+
+Client tests use `respx` to mock HTTP calls and test actual client logic:
+
+```python
+BASE_URL = "https://erp.example.com/api/v1"
+
+@pytest_asyncio.fixture
+async def base_client() -> AsyncGenerator[BaseERPClient, None]:
+    c = BaseERPClient(base_url=BASE_URL, allowed_domain="arbisoft.com")
+    yield c
+    await c.close()
+
+@pytest.fixture
+def timelogs_client(base_client: BaseERPClient) -> TimelogsClient:
+    return TimelogsClient(base_client)
+
+@respx.mock
+async def test_get_active_projects(self, timelogs_client: TimelogsClient) -> None:
+    respx.get(f"{BASE_URL}/project-logs/person/active_project_list/").mock(
+        return_value=httpx.Response(200, json=[{"id": 1, "team": "Alpha"}])
+    )
+    result = await timelogs_client.get_active_projects(token="tok")
+    assert result["status"] == "success"
+```
+
+### Security tests (`tests/test_security.py`)
+
+Security tests auto-discover tools via AST scanning of `tools/*.py`. You do not need to register new tools manually -- the following are enforced automatically:
+
+- **SEC-01 (no email param):** `TestSEC01NoEmailParam` scans both AST and runtime signatures
+- **Tool naming:** `TestToolNamingConvention` verifies `{domain}_` prefix on every tool
+
+### Feature flag tests (`tests/test_feature_flags.py`)
+
+Tests for `tools/__init__.py` -- domain loading, unknown domain handling, and sensitive domain gating.
+
+## Feature Flags
+
+Two environment variables control which domains are loaded:
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `ENABLED_DOMAINS` | Comma-separated list of domains to activate | `timelogs` |
+| `ENABLE_SENSITIVE_DOMAINS` | Must be `true` to load domains in `SENSITIVE_DOMAINS` | (unset) |
+
+Behavior:
+- Unknown domain names in `ENABLED_DOMAINS` are logged and skipped
+- If **no** valid domains load, the server exits (`SystemExit(1)`)
+- Requesting a sensitive domain without `ENABLE_SENSITIVE_DOMAINS=true` exits immediately
+
+Example: `ENABLED_DOMAINS=timelogs,payroll ENABLE_SENSITIVE_DOMAINS=true`
 
 ## Security Compliance Checklist
 
@@ -228,65 +427,50 @@ Every tool must comply with these controls. The test suite enforces them automat
 
 | Control | Rule | Enforced by |
 |---------|------|-------------|
-| SEC-01 | No `email` parameter on any tool | `TestNoEmailParameter` (AST + runtime inspection) |
-| SEC-02 | Domain restriction via Google token | `_get_erp_token()` checks `hd` claim + email suffix |
+| SEC-01 | No `email` parameter on any tool | `TestSEC01NoEmailParam` (AST + runtime inspection) |
+| SEC-02 | Domain restriction via Google token | `get_erp_token()` checks `hd` claim + email suffix |
 | SEC-03 | Hashed cache keys | `TTLCache` uses SHA-256 internally |
-| SEC-04 | No stack traces in responses | `@_tool_error_handler` catches all exceptions; `TestNoStackTraces` verifies |
-| SEC-05 | Date range caps on bulk operations | Constants `_MAX_FILL_DAYS` (31) and `_MAX_QUERY_DAYS` (366) |
-| SEC-06 | No HTTP redirects | `follow_redirects=False` in ERPClient |
-| SEC-07 | HTTPS enforcement | ERPClient rejects non-HTTPS for non-localhost targets |
+| SEC-04 | No stack traces in responses | `@tool_error_handler` catches all exceptions; generic message to client |
+| SEC-05 | Date range caps on bulk operations | `MAX_FILL_DAYS` (31) and `MAX_QUERY_DAYS` (366) in `_constants.py` |
+| SEC-06 | No HTTP redirects | `follow_redirects=False` in `BaseERPClient` |
+| SEC-07 | HTTPS enforcement | `BaseERPClient` rejects non-HTTPS for non-localhost targets |
+| SEC-08 | Sensitive domain gate | `SENSITIVE_DOMAINS` in `tools/__init__.py` requires `ENABLE_SENSITIVE_DOMAINS=true` |
 
 **What this means for you:**
-- Never add an `email` parameter to a tool function — the test suite will catch it
-- Never include exception details in `ToolError` messages — use the `@_tool_error_handler` decorator
-- If your tool accepts a date range, enforce `_MAX_FILL_DAYS` or `_MAX_QUERY_DAYS`
+- Never add an `email` parameter to a tool function -- the test suite will catch it
+- Never include exception details in `ToolError` messages -- use the `@tool_error_handler` decorator
+- If your tool accepts a date range, enforce `MAX_FILL_DAYS` or `MAX_QUERY_DAYS` from `_constants.py`
+- If your domain handles PII/financial data, add it to `SENSITIVE_DOMAINS`
 
-## Updating the Dockerfile
+## Pre-Submit Checklist
 
-The Dockerfile explicitly lists application files on line 33:
+### All tools
 
-```dockerfile
-COPY --chown=root:root --chmod=644 server.py erp_client.py ./
-```
-
-If you add a new Python module (e.g. `utils.py`), you **must** update this line. The Docker build will succeed without it, but the container will fail at runtime with `ModuleNotFoundError`.
-
-## Development Workflow
-
-```bash
-# Setup
-python3 -m venv ~/.virtualenvs/erp-mcp
-source ~/.virtualenvs/erp-mcp/bin/activate
-pip install -r requirements.txt
-pip install -e ".[dev]"
-
-# Run tests
-pytest tests/ -v
-
-# Lint
-ruff check .
-ruff format --check .
-
-# Type check
-mypy server.py erp_client.py
-```
-
-All three must pass before submitting a PR. CI runs `pytest` automatically on push and PR.
-
-## Checklist Before Submitting
-
-- [ ] ERPClient method added with `token: str` as first parameter
-- [ ] MCP tool uses `@mcp.tool` + `@_tool_error_handler` decorators
+- [ ] Client method added in `clients/{domain}.py` with `token: str` as first parameter
+- [ ] `@mcp.tool` + `@tool_error_handler` decorators on the tool closure
+- [ ] Tool name follows `{domain}_{verb}_{resource}` convention
 - [ ] Tool docstring describes what it does (this is the AI-facing description)
-- [ ] `_get_erp_token()` used for auth (not manual token handling)
-- [ ] `_check_erp_result()` wraps the ERPClient call
-- [ ] `mock_erp` fixture updated with return value for new method
-- [ ] Server tests: happy path + error path (RuntimeError -> generic ToolError)
-- [ ] Client tests: respx-mocked HTTP test
-- [ ] **Write tools only:** `WRITE_OP` audit log emitted after success
-- [ ] **Write tools only:** Entry added to `TestAuditLogCoverage.WRITE_TOOLS`
-- [ ] **Write tools only:** Input validation (description length, hours bounds, date caps)
+- [ ] `get_erp_token()` used for auth (not manual token handling)
+- [ ] `check_erp_result()` wraps the client call
+- [ ] `mock_timelogs` (or equivalent domain mock) fixture updated with return value
+- [ ] Tool test: happy path + error path (`RuntimeError` -> generic `ToolError`)
+- [ ] Client test: `respx`-mocked HTTP test
 - [ ] No `email` parameter on the tool function (SEC-01)
-- [ ] `ruff check .` and `pytest tests/ -v` pass
-- [ ] Dockerfile COPY line updated if new modules added
+- [ ] `pytest tests/ -v`, `ruff check .`, `ruff format --check .`, and `mypy` pass
+
+### Write tools only
+
+- [ ] `WRITE_OP` audit log emitted after success
+- [ ] Entry added to `TestAuditLogCoverage.WRITE_TOOLS` in tool test file
+- [ ] Input validation (description length, hours bounds, date caps)
+
+### New domains only
+
+- [ ] Client class in `clients/{domain}.py` using composition (`self._base: BaseERPClient`)
+- [ ] Field added to `ERPClientRegistry` in `clients/__init__.py`
+- [ ] Tool module `tools/{domain}.py` with `register(mcp)` function
+- [ ] Entry in `AVAILABLE_DOMAINS` in `tools/__init__.py`
+- [ ] Added to `SENSITIVE_DOMAINS` if PII/financial data (SEC-08)
+- [ ] Test files: `tests/test_clients_{domain}.py` and `tests/test_tools_{domain}.py`
+- [ ] Dockerfile updated if new top-level `.py` file added outside `clients/` or `tools/`
 - [ ] README.md tools table updated

@@ -68,7 +68,7 @@ jobs:
         run: ruff check .
 
       - name: Type check
-        run: mypy server.py erp_client.py
+        run: mypy server.py _auth.py _constants.py tools/ clients/
 
       - name: Test
         run: pytest tests/ -v --junitxml=test-results.xml

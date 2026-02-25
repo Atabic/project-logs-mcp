@@ -32,8 +32,13 @@ WORKDIR /app
 COPY --from=builder /app/venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
-# NOTE: Explicitly list application files. Update this line when adding new modules.
-COPY --chown=root:root --chmod=644 server.py erp_client.py ./
+# NOTE: Explicitly list top-level files; packages are copied as directories.
+# Directories need 755 (execute for traversal); files inside get 644 from umask.
+COPY --chown=root:root --chmod=644 server.py _auth.py _constants.py ./
+COPY --chown=root:root clients/ ./clients/
+COPY --chown=root:root tools/ ./tools/
+RUN find clients/ tools/ -type d -exec chmod 755 {} + && \
+    find clients/ tools/ -type f -exec chmod 644 {} +
 
 ENV MCP_HOST=0.0.0.0
 
