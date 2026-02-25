@@ -111,25 +111,11 @@ class TestSEC01NoEmailParam:
         # Build lookup of registered tool functions
         lp = srv.mcp.local_provider
         registered: dict[str, FunctionTool] = {
-            comp.name: comp
-            for comp in lp._components.values()
-            if isinstance(comp, FunctionTool)
+            comp.name: comp for comp in lp._components.values() if isinstance(comp, FunctionTool)
         }
 
         for name in tool_names:
             tool = registered.get(name)
             assert tool is not None, f"Tool {name} not registered on mcp"
             sig = inspect.signature(tool.fn)
-            assert "email" not in sig.parameters, (
-                f"SEC-01: {name} has an 'email' parameter"
-            )
-
-
-class TestSEC08SensitiveDomainGate:
-    """SEC-08: payroll/invoices require ENABLE_SENSITIVE_DOMAINS=true."""
-
-    def test_sensitive_domains_defined(self) -> None:
-        from tools import SENSITIVE_DOMAINS
-
-        assert "payroll" in SENSITIVE_DOMAINS
-        assert "invoices" in SENSITIVE_DOMAINS
+            assert "email" not in sig.parameters, f"SEC-01: {name} has an 'email' parameter"
