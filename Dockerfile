@@ -1,5 +1,5 @@
 # ---------- Stage 1: builder ----------
-FROM python:3.12.8-slim-bookworm@sha256:2199a62885a12290dc9c5be3ca0681d367576ab7bf037da120e564723292a2f0 AS builder
+FROM python:3.14.3-slim-bookworm@sha256:ac8c3a801ac7c62f305cbc399a52e9e50077fd183ba57f1c052e6c70d0ed030e AS builder
 
 WORKDIR /app
 
@@ -11,7 +11,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     /app/venv/bin/pip uninstall -y pip setuptools wheel 2>/dev/null || true
 
 # ---------- Stage 2: runtime ----------
-FROM python:3.12.8-slim-bookworm@sha256:2199a62885a12290dc9c5be3ca0681d367576ab7bf037da120e564723292a2f0
+FROM python:3.14.3-slim-bookworm@sha256:ac8c3a801ac7c62f305cbc399a52e9e50077fd183ba57f1c052e6c70d0ed030e
 
 ARG APP_VERSION=dev
 ARG BUILD_DATE=unknown
