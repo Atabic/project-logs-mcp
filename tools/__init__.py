@@ -19,6 +19,7 @@ __all__ = ["load_domains"]
 # Map domain name -> module path (relative import within the package).
 AVAILABLE_DOMAINS: dict[str, str] = {
     "timelogs": "tools.timelogs",
+    "leaves": "tools.leaves",
 }
 
 # Domains that require ENABLE_SENSITIVE_DOMAINS=true (SEC-08).
@@ -42,14 +43,10 @@ def load_domains(mcp: FastMCP) -> list[str]:
         raise SystemExit(1)
 
     # SEC-08: gate sensitive domains
-    sensitive_enabled = (
-        os.environ.get("ENABLE_SENSITIVE_DOMAINS", "").lower().strip() == "true"
-    )
+    sensitive_enabled = os.environ.get("ENABLE_SENSITIVE_DOMAINS", "").lower().strip() == "true"
     for domain in requested:
         if domain in SENSITIVE_DOMAINS and not sensitive_enabled:
-            logger.critical(
-                "Domain '%s' requires ENABLE_SENSITIVE_DOMAINS=true (SEC-08)", domain
-            )
+            logger.critical("Domain '%s' requires ENABLE_SENSITIVE_DOMAINS=true (SEC-08)", domain)
             raise SystemExit(1)
 
     loaded: list[str] = []

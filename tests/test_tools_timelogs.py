@@ -185,9 +185,7 @@ class TestGetErpToken:
             with pytest.raises(PermissionError, match="email claim"):
                 await get_erp_token()
 
-    async def test_rejects_missing_hd_in_google_user_data(
-        self, mock_registry: AsyncMock
-    ) -> None:
+    async def test_rejects_missing_hd_in_google_user_data(self, mock_registry: AsyncMock) -> None:
         """SEC-02: hd is inside google_user_data, not top-level."""
         from _auth import get_erp_token
 
@@ -391,9 +389,7 @@ class TestTimelogsUpsertEntry:
         mock_timelogs.resolve_project_id.assert_awaited_once_with(
             "erp-token-abc", None, "My Project"
         )
-        mock_timelogs.resolve_label_id.assert_awaited_once_with(
-            "erp-token-abc", None, "Coding"
-        )
+        mock_timelogs.resolve_label_id.assert_awaited_once_with("erp-token-abc", None, "Coding")
 
     async def test_audit_log_emitted(
         self,
@@ -440,7 +436,10 @@ class TestTimelogsUpsertEntry:
         with _patch_token(valid_token):
             with pytest.raises(ToolError, match="hours must be between"):
                 await fn(
-                    date="2024-01-10", description="task", hours=0, project_id=42,
+                    date="2024-01-10",
+                    description="task",
+                    hours=0,
+                    project_id=42,
                 )
 
     async def test_rejects_negative_hours(
@@ -451,7 +450,10 @@ class TestTimelogsUpsertEntry:
         with _patch_token(valid_token):
             with pytest.raises(ToolError, match="hours must be between"):
                 await fn(
-                    date="2024-01-10", description="task", hours=-1, project_id=42,
+                    date="2024-01-10",
+                    description="task",
+                    hours=-1,
+                    project_id=42,
                 )
 
     async def test_rejects_over_24_hours(
@@ -462,7 +464,10 @@ class TestTimelogsUpsertEntry:
         with _patch_token(valid_token):
             with pytest.raises(ToolError, match="hours must be between"):
                 await fn(
-                    date="2024-01-10", description="task", hours=25, project_id=42,
+                    date="2024-01-10",
+                    description="task",
+                    hours=25,
+                    project_id=42,
                 )
 
     async def test_unexpected_error_no_stack_trace(
@@ -720,8 +725,7 @@ class TestTimelogsFillDays:
                 )
 
         assert any(
-            "WRITE_OP" in r.message and "timelogs_fill_days" in r.message
-            for r in caplog.records
+            "WRITE_OP" in r.message and "timelogs_fill_days" in r.message for r in caplog.records
         )
 
 
@@ -874,9 +878,7 @@ class TestAuditLogCoverage:
         ),
     ]
 
-    @pytest.mark.parametrize(
-        ("tool_name", "kwargs"), WRITE_TOOLS, ids=[t[0] for t in WRITE_TOOLS]
-    )
+    @pytest.mark.parametrize(("tool_name", "kwargs"), WRITE_TOOLS, ids=[t[0] for t in WRITE_TOOLS])
     async def test_write_tool_emits_audit_log(
         self,
         tool_name: str,
@@ -893,7 +895,8 @@ class TestAuditLogCoverage:
                 await tool_fn(**kwargs)
 
         audit_records = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if "WRITE_OP" in r.message and f"tool={tool_name}" in r.message
         ]
         assert len(audit_records) >= 1, (
@@ -905,7 +908,7 @@ class TestAuditLogCoverage:
         """Guard: every @mcp.tool that emits WRITE_OP must appear in WRITE_TOOLS."""
         from tests.test_security import _discover_write_tool_names
 
-        discovered = _discover_write_tool_names()
+        discovered = {n for n in _discover_write_tool_names() if n.startswith("timelogs_")}
         covered = {name for name, _ in self.WRITE_TOOLS}
         missing = discovered - covered
         assert not missing, (

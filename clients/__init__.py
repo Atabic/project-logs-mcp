@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from clients._base import BaseERPClient
+from clients.leaves import LeavesClient
 from clients.timelogs import TimelogsClient
 
 __all__ = ["ERPClientRegistry", "get_registry", "set_registry"]
@@ -20,9 +21,11 @@ class ERPClientRegistry:
 
     base: BaseERPClient
     timelogs: TimelogsClient = field(init=False)
+    leaves: LeavesClient = field(init=False)
 
     def __post_init__(self) -> None:
         self.timelogs = TimelogsClient(self.base)
+        self.leaves = LeavesClient(self.base)
 
     async def close(self) -> None:
         await self.base.close()
