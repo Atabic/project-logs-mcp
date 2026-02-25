@@ -23,8 +23,15 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Config (keep example, ignore actual)
-authorized_users.json
+# Environment
+.env
 
-# Playwright browsers (used on Render when PLAYWRIGHT_BROWSERS_PATH=./playwright-browsers)
-playwright-browsers/
+# Claude Code
+.claude/
+
+# Credentials
+*.pem
+*.key
+*.p12
+credentials.json
+service-account*.json

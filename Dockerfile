@@ -1,17 +1,48 @@
-# Use official Playwright Python image so Chromium is pre-installed (required for ERP browser auth when deployed).
-# See: https://playwright.dev/python/docs/docker
-FROM mcr.microsoft.com/playwright/python:v1.49.0-noble
+# ---------- Stage 1: builder ----------
+FROM python:3.12.8-slim-bookworm@sha256:2199a62885a12290dc9c5be3ca0681d367576ab7bf037da120e564723292a2f0 AS builder
 
 WORKDIR /app
 
-# Install Python deps (no need to run playwright install chromium; image has it).
-COPY requirements-sse.txt requirements.txt ./
-RUN pip install --no-cache-dir -r requirements-sse.txt
+RUN python -m venv /app/venv
 
-COPY server_sse.py server.py api_client.py auth.py oauth_server.py erp_browser_auth.py erp_browser_sessions.py ./
-# authorized_users.json is gitignored; auth.py creates an example at runtime if missing. Set MCP_AUTHORIZED_USERS in env instead.
+COPY requirements.lock .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /app/venv/bin/pip install -r requirements.lock && \
+    /app/venv/bin/pip uninstall -y pip setuptools wheel 2>/dev/null || true
 
-ENV PORT=8000
-EXPOSE 8000
+# ---------- Stage 2: runtime ----------
+FROM python:3.12.8-slim-bookworm@sha256:2199a62885a12290dc9c5be3ca0681d367576ab7bf037da120e564723292a2f0
 
-CMD ["python", "server_sse.py"]
+ARG APP_VERSION=dev
+ARG BUILD_DATE=unknown
+# APP_VERSION is read at runtime for version reporting; also used in OCI labels.
+ENV APP_VERSION=${APP_VERSION}
+LABEL org.opencontainers.image.source="https://github.com/arbisoft/erp-mcp" \
+      org.opencontainers.image.description="ERP MCP Server for Arbisoft Workstream" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r --gid 1001 appuser && \
+    useradd -r --uid 1001 --gid 1001 --no-log-init -s /usr/sbin/nologin appuser
+
+WORKDIR /app
+
+COPY --from=builder /app/venv /app/venv
+ENV PATH="/app/venv/bin:$PATH"
+
+# NOTE: Explicitly list application files. Update this line when adding new modules.
+COPY --chown=root:root --chmod=644 server.py erp_client.py ./
+
+ENV MCP_HOST=0.0.0.0
+
+USER 1001
+
+# Port 8100 matches MCP_PORT default. If MCP_PORT is overridden at runtime,
+# this health check will report unhealthy. For custom ports, override HEALTHCHECK.
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=15s \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8100/health', timeout=3)"
+
+EXPOSE 8100
+CMD ["python", "server.py"]
