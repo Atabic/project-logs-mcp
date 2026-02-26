@@ -34,15 +34,15 @@ def register(mcp: FastMCP) -> None:
 
     @mcp.tool
     @tool_error_handler("Failed to fetch leave summary. Please try again.")
-    async def leaves_get_summary(fiscal_year: int | None = None) -> dict[str, Any]:
-        """Get leave balances and fiscal summary.
+    async def leaves_get_summary(selected_year: int) -> dict[str, Any]:
+        """Get leave balances for the authenticated user.
 
         Args:
-            fiscal_year: Fiscal year (e.g. 2024). Defaults to current if omitted.
+            selected_year: The fiscal year to query (e.g. 2026).
         """
         token, _email = await get_erp_token()
         return check_erp_result(
-            await get_registry().leaves.get_summary(token, fiscal_year=fiscal_year)
+            await get_registry().leaves.get_summary(token, selected_year)
         )
 
     @mcp.tool

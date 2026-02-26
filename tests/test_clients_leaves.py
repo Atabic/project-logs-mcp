@@ -53,51 +53,21 @@ class TestGetChoices:
 
 class TestGetSummary:
     @respx.mock
-    async def test_returns_summary_without_fiscal_year(self, leaves_client: LeavesClient) -> None:
-        respx.get(f"{BASE_URL}/leaves/leave_summary/get/").mock(
+    async def test_returns_summary(self, leaves_client: LeavesClient) -> None:
+        route = respx.get(f"{BASE_URL}/leaves/leave_summary/get/").mock(
             return_value=httpx.Response(200, json={"total": 20, "used": 5})
         )
-        respx.get(f"{BASE_URL}/leaves/individual_fiscal_summary/").mock(
-            return_value=httpx.Response(200, json={"fiscal": "data"})
-        )
-        result = await leaves_client.get_summary("tok")
+        result = await leaves_client.get_summary("tok", selected_year=2026)
         assert result["status"] == "success"
-        assert "summary" in result["data"]
-        assert "fiscal_summary" in result["data"]
-
-    @respx.mock
-    async def test_returns_summary_with_fiscal_year(self, leaves_client: LeavesClient) -> None:
-        respx.get(f"{BASE_URL}/leaves/leave_summary/get/").mock(
-            return_value=httpx.Response(200, json={"total": 20, "used": 5})
-        )
-        fiscal_route = respx.get(f"{BASE_URL}/leaves/individual_fiscal_summary/").mock(
-            return_value=httpx.Response(200, json={"fiscal": "2024"})
-        )
-        result = await leaves_client.get_summary("tok", fiscal_year=2024)
-        assert result["status"] == "success"
-        # Verify year param was sent
-        assert fiscal_route.calls.last.request.url.params["year"] == "2024"
+        assert route.calls.last.request.url.params["selected_year"] == "2026"
 
     @respx.mock
     async def test_returns_error_when_summary_fails(self, leaves_client: LeavesClient) -> None:
         respx.get(f"{BASE_URL}/leaves/leave_summary/get/").mock(
             return_value=httpx.Response(500, json={"detail": "server error"})
         )
-        result = await leaves_client.get_summary("tok")
+        result = await leaves_client.get_summary("tok", selected_year=2026)
         assert result["status"] == "error"
-
-    @respx.mock
-    async def test_fiscal_failure_returns_none(self, leaves_client: LeavesClient) -> None:
-        """When the fiscal summary call fails, fiscal_summary should be None."""
-        respx.get(f"{BASE_URL}/leaves/leave_summary/get/").mock(
-            return_value=httpx.Response(200, json={"total": 20})
-        )
-        respx.get(f"{BASE_URL}/leaves/individual_fiscal_summary/").mock(
-            return_value=httpx.Response(500, json={"detail": "error"})
-        )
-        result = await leaves_client.get_summary("tok")
-        assert result["status"] == "success"
-        assert result["data"]["fiscal_summary"] is None
 
 
 class TestGetMonthLeaves:

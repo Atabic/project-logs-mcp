@@ -80,7 +80,7 @@ def mock_leaves() -> AsyncMock:
     client.get_choices.return_value = {"status": "success", "data": []}
     client.get_summary.return_value = {
         "status": "success",
-        "data": {"summary": {}, "fiscal_summary": {}},
+        "data": {"total": 20, "used": 5},
     }
     client.get_month_leaves.return_value = {"status": "success", "data": []}
     client.get_holidays.return_value = {"status": "success", "data": []}
@@ -142,27 +142,16 @@ class TestLeavesGetChoices:
 
 
 class TestLeavesGetSummary:
-    async def test_calls_client_no_year(
+    async def test_calls_client_with_selected_year(
         self, mock_leaves: AsyncMock, mock_registry: AsyncMock, valid_token: AccessToken
     ) -> None:
         fn = _get_tool_fn("leaves_get_summary")
         set_registry(mock_registry)
         with _patch_token(valid_token):
-            result = await fn()
+            result = await fn(selected_year=2026)
 
         assert result["status"] == "success"
-        mock_leaves.get_summary.assert_awaited_once_with("erp-token-abc", fiscal_year=None)
-
-    async def test_calls_client_with_year(
-        self, mock_leaves: AsyncMock, mock_registry: AsyncMock, valid_token: AccessToken
-    ) -> None:
-        fn = _get_tool_fn("leaves_get_summary")
-        set_registry(mock_registry)
-        with _patch_token(valid_token):
-            result = await fn(fiscal_year=2024)
-
-        assert result["status"] == "success"
-        mock_leaves.get_summary.assert_awaited_once_with("erp-token-abc", fiscal_year=2024)
+        mock_leaves.get_summary.assert_awaited_once_with("erp-token-abc", 2026)
 
 
 class TestLeavesListMonth:

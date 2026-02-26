@@ -28,34 +28,21 @@ class LeavesClient:
         """Get leave types and approver for the user."""
         return await self._base._request("GET", "leaves/choices/get/", token)
 
-    async def get_summary(self, token: str, fiscal_year: int | None = None) -> dict[str, Any]:
-        """Get leave balances + fiscal summary.
+    async def get_summary(self, token: str, selected_year: int) -> dict[str, Any]:
+        """Get leave balances for the authenticated user.
 
-        If *fiscal_year* is None, fetches fiscal summary without a year filter.
+        The ERP ``LeaveSummaryView`` identifies the person from the auth token,
+        so no person-PK or email parameter is needed (SEC-01).
+
+        Args:
+            selected_year: Fiscal year to query (required by the ERP backend).
         """
-        summary = await self._base._request("GET", "leaves/leave_summary/get/", token)
-        if summary["status"] != "success":
-            return summary
-
-        params: dict[str, Any] = {}
-        if fiscal_year is not None:
-            params["year"] = fiscal_year
-        fiscal = await self._base._request(
+        return await self._base._request(
             "GET",
-            "leaves/individual_fiscal_summary/",
+            "leaves/leave_summary/get/",
             token,
-            params=params if params else None,
+            params={"selected_year": selected_year},
         )
-
-        return {
-            "status": "success",
-            "data": {
-                "summary": summary.get("data", {}),
-                "fiscal_summary": (
-                    fiscal.get("data", {}) if fiscal.get("status") == "success" else None
-                ),
-            },
-        }
 
     async def get_month_leaves(self, token: str, year: int, month: int) -> dict[str, Any]:
         """Get approved leaves for a month."""
