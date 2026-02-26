@@ -51,6 +51,22 @@ class TestGetChoices:
         assert result["status"] == "success"
 
 
+class TestGetFiscalYears:
+    @respx.mock
+    async def test_returns_fiscal_years(self, leaves_client: LeavesClient) -> None:
+        respx.get(f"{BASE_URL}/leaves/individual_leave_fiscal_years/").mock(
+            return_value=httpx.Response(200, json={
+                "selected_fiscal_year": 12,
+                "fiscal_years": [
+                    {"id": 12, "start_date": "2025-07-01", "end_date": "2026-06-30"},
+                ],
+            })
+        )
+        result = await leaves_client.get_fiscal_years("tok")
+        assert result["status"] == "success"
+        assert result["data"]["selected_fiscal_year"] == 12
+
+
 class TestGetSummary:
     @respx.mock
     async def test_returns_summary(self, leaves_client: LeavesClient) -> None:
@@ -193,6 +209,7 @@ class TestSEC01NoEmailParam:
 
     _ALL_METHODS = [
         "get_choices",
+        "get_fiscal_years",
         "get_summary",
         "get_month_leaves",
         "get_holidays",

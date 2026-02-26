@@ -22,10 +22,10 @@ class TestLoadDomains:
         assert any(name.startswith("leaves_") for name in tool_names)
 
     def test_tool_count(self) -> None:
-        """All 20 tools (11 timelogs + 9 leaves) are registered."""
+        """All 21 tools (11 timelogs + 10 leaves) are registered."""
         from tools import load_domains
 
         test_mcp = FastMCP(name="test")
         loaded = load_domains(test_mcp)
         assert loaded == ["timelogs", "leaves"]
-        assert len(_get_tool_names(test_mcp)) == 20
+        assert len(_get_tool_names(test_mcp)) == 21

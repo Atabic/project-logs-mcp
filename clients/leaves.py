@@ -28,6 +28,12 @@ class LeavesClient:
         """Get leave types and approver for the user."""
         return await self._base._request("GET", "leaves/choices/get/", token)
 
+    async def get_fiscal_years(self, token: str) -> dict[str, Any]:
+        """Get available fiscal years and currently selected fiscal year."""
+        return await self._base._request(
+            "GET", "leaves/individual_leave_fiscal_years/", token,
+        )
+
     async def get_summary(self, token: str, selected_year: int) -> dict[str, Any]:
         """Get leave balances for the authenticated user.
 
@@ -35,7 +41,7 @@ class LeavesClient:
         so no person-PK or email parameter is needed (SEC-01).
 
         Args:
-            selected_year: Fiscal year to query (required by the ERP backend).
+            selected_year: Fiscal year PK to query (required by the ERP backend).
         """
         return await self._base._request(
             "GET",

@@ -33,17 +33,33 @@ def register(mcp: FastMCP) -> None:
         return check_erp_result(await get_registry().leaves.get_choices(token))
 
     @mcp.tool
+    @tool_error_handler("Failed to fetch fiscal years. Please try again.")
+    async def leaves_get_fiscal_years() -> dict[str, Any]:
+        """Get available fiscal years for leave summary queries.
+
+        Returns the list of fiscal years with their IDs and date ranges,
+        plus the ID of the currently active fiscal year.
+        """
+        token, _email = await get_erp_token()
+        return check_erp_result(await get_registry().leaves.get_fiscal_years(token))
+
+    @mcp.tool
     @tool_error_handler("Failed to fetch leave summary. Please try again.")
-    async def leaves_get_summary(selected_year: int) -> dict[str, Any]:
+    async def leaves_get_summary(fiscal_year_id: int | None = None) -> dict[str, Any]:
         """Get leave balances for the authenticated user.
 
         Args:
-            selected_year: The fiscal year to query (e.g. 2026).
+            fiscal_year_id: Fiscal year ID from leaves_get_fiscal_years.
+                If omitted, the current active fiscal year is used automatically.
         """
         token, _email = await get_erp_token()
-        return check_erp_result(
-            await get_registry().leaves.get_summary(token, selected_year)
-        )
+        client = get_registry().leaves
+        if fiscal_year_id is None:
+            fy_result = check_erp_result(await client.get_fiscal_years(token))
+            fiscal_year_id = fy_result.get("data", {}).get("selected_fiscal_year")
+            if fiscal_year_id is None:
+                raise ToolError("No active fiscal year found.")
+        return check_erp_result(await client.get_summary(token, fiscal_year_id))
 
     @mcp.tool
     @tool_error_handler("Failed to fetch monthly leaves. Please try again.")

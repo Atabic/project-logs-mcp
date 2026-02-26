@@ -78,6 +78,10 @@ def mock_leaves() -> AsyncMock:
     """Return a fully mocked ``LeavesClient`` instance."""
     client = AsyncMock()
     client.get_choices.return_value = {"status": "success", "data": []}
+    client.get_fiscal_years.return_value = {
+        "status": "success",
+        "data": {"selected_fiscal_year": 12, "fiscal_years": [{"id": 12}]},
+    }
     client.get_summary.return_value = {
         "status": "success",
         "data": {"total": 20, "used": 5},
@@ -141,17 +145,59 @@ class TestLeavesGetChoices:
         mock_leaves.get_choices.assert_awaited_once_with("erp-token-abc")
 
 
-class TestLeavesGetSummary:
-    async def test_calls_client_with_selected_year(
+class TestLeavesGetFiscalYears:
+    async def test_calls_client(
         self, mock_leaves: AsyncMock, mock_registry: AsyncMock, valid_token: AccessToken
     ) -> None:
+        fn = _get_tool_fn("leaves_get_fiscal_years")
+        set_registry(mock_registry)
+        with _patch_token(valid_token):
+            result = await fn()
+
+        assert result["status"] == "success"
+        mock_leaves.get_fiscal_years.assert_awaited_once_with("erp-token-abc")
+
+
+class TestLeavesGetSummary:
+    async def test_auto_resolves_fiscal_year(
+        self, mock_leaves: AsyncMock, mock_registry: AsyncMock, valid_token: AccessToken
+    ) -> None:
+        """When no fiscal_year_id, tool fetches fiscal years first."""
         fn = _get_tool_fn("leaves_get_summary")
         set_registry(mock_registry)
         with _patch_token(valid_token):
-            result = await fn(selected_year=2026)
+            result = await fn()
 
         assert result["status"] == "success"
-        mock_leaves.get_summary.assert_awaited_once_with("erp-token-abc", 2026)
+        mock_leaves.get_fiscal_years.assert_awaited_once_with("erp-token-abc")
+        mock_leaves.get_summary.assert_awaited_once_with("erp-token-abc", 12)
+
+    async def test_uses_provided_fiscal_year_id(
+        self, mock_leaves: AsyncMock, mock_registry: AsyncMock, valid_token: AccessToken
+    ) -> None:
+        """When fiscal_year_id is provided, use it directly."""
+        fn = _get_tool_fn("leaves_get_summary")
+        set_registry(mock_registry)
+        with _patch_token(valid_token):
+            result = await fn(fiscal_year_id=11)
+
+        assert result["status"] == "success"
+        mock_leaves.get_fiscal_years.assert_not_awaited()
+        mock_leaves.get_summary.assert_awaited_once_with("erp-token-abc", 11)
+
+    async def test_raises_when_no_active_fiscal_year(
+        self, mock_leaves: AsyncMock, mock_registry: AsyncMock, valid_token: AccessToken
+    ) -> None:
+        """When fiscal years endpoint returns no selected year, raise ToolError."""
+        mock_leaves.get_fiscal_years.return_value = {
+            "status": "success",
+            "data": {"selected_fiscal_year": None, "fiscal_years": []},
+        }
+        fn = _get_tool_fn("leaves_get_summary")
+        set_registry(mock_registry)
+        with _patch_token(valid_token):
+            with pytest.raises(ToolError, match="No active fiscal year"):
+                await fn()
 
 
 class TestLeavesListMonth:
