@@ -11,9 +11,9 @@ _constants.py       Shared constants — MAX_FILL_DAYS, MAX_QUERY_DAYS, MAX_DESC
 clients/
   __init__.py       ERPClientRegistry (dataclass), get_registry(), set_registry()
   _base.py          BaseERPClient + TTLCache — HTTP transport, token exchange, static helpers
-  timelogs.py       TimelogsClient — composition over inheritance, delegates to BaseERPClient._request()
+  timelogs.py       TimelogsClient — composition over inheritance, delegates to BaseERPClient.request()
 tools/
-  __init__.py       Feature flag loader — AVAILABLE_DOMAINS, SENSITIVE_DOMAINS, load_domains(mcp)
+  __init__.py       Domain loader — AVAILABLE_DOMAINS, load_domains(mcp)
   timelogs.py       11 timelog tools inside register(mcp) pattern
 tests/
   conftest.py                Sets env vars before module imports
@@ -30,7 +30,7 @@ tests/
 Client (Claude/Cursor/etc.)
   -> FastMCP (@mcp.tool closure in tools/{domain}.py)
     -> get_erp_token() extracts Google token, enforces domain, exchanges for ERP token
-    -> get_registry().{domain}.{method}() makes HTTP call to ERP API via BaseERPClient._request()
+    -> get_registry().{domain}.{method}() makes HTTP call to ERP API via BaseERPClient.request()
     -> check_erp_result() converts error dicts to ToolError
   -> Response returned to client
 ```
@@ -64,7 +64,7 @@ class PayrollClient:
         self._base = base
 
     async def get_payslips(self, token: str, year: int, month: int) -> dict[str, Any]:
-        return await self._base._request(
+        return await self._base.request(
             "GET", "payroll/payslips/", token, params={"year": year, "month": month}
         )
 ```
@@ -72,7 +72,7 @@ class PayrollClient:
 **Rules:**
 - First parameter is always `token: str`
 - Return type is always `dict[str, Any]`
-- Delegate all HTTP I/O to `self._base._request()` -- never create your own `httpx` client
+- Delegate all HTTP I/O to `self._base.request()` -- never create your own `httpx` client
 - Use `BaseERPClient` static helpers (e.g., `_parse_abbreviated_date()`) when needed
 
 ### Step 2: Register the client in the registry (`clients/__init__.py`)
@@ -132,7 +132,7 @@ def register(mcp: FastMCP) -> None:
         )
 ```
 
-### Step 4: Register the domain in the feature flag loader (`tools/__init__.py`)
+### Step 4: Register the domain in the domain loader (`tools/__init__.py`)
 
 ```python
 AVAILABLE_DOMAINS: dict[str, str] = {
@@ -141,13 +141,11 @@ AVAILABLE_DOMAINS: dict[str, str] = {
 }
 ```
 
-If the domain handles PII or financial data, also add it to `SENSITIVE_DOMAINS` (SEC-08):
-
-```python
-SENSITIVE_DOMAINS: frozenset[str] = frozenset({"payroll", "invoices"})
-```
-
-Sensitive domains require `ENABLE_SENSITIVE_DOMAINS=true` at runtime. Without it, the server exits on startup.
+**Important:** Tool modules (`tools/*.py`) are imported at module load time via
+`load_domains()` in `tools/__init__.py`, NOT inside the server lifespan handler.
+This means tool modules MUST NOT have module-level side effects (network calls,
+file I/O, heavy imports). All initialization that requires the client registry
+should happen inside the tool closures, not at module scope.
 
 ### Step 5: Update the Dockerfile
 
@@ -174,7 +172,7 @@ Touch **4 files** (2 source + 2 test).
 ```python
 async def get_team_members(self, token: str, team_id: int) -> dict[str, Any]:
     """Fetch team members for a project."""
-    return await self._base._request(
+    return await self._base.request(
         "GET", "project-logs/team/members/", token, params={"team_id": team_id}
     )
 ```
@@ -403,23 +401,7 @@ Security tests auto-discover tools via AST scanning of `tools/*.py`. You do not 
 
 ### Feature flag tests (`tests/test_feature_flags.py`)
 
-Tests for `tools/__init__.py` -- domain loading, unknown domain handling, and sensitive domain gating.
-
-## Feature Flags
-
-Two environment variables control which domains are loaded:
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `ENABLED_DOMAINS` | Comma-separated list of domains to activate | `timelogs` |
-| `ENABLE_SENSITIVE_DOMAINS` | Must be `true` to load domains in `SENSITIVE_DOMAINS` | (unset) |
-
-Behavior:
-- Unknown domain names in `ENABLED_DOMAINS` are logged and skipped
-- If **no** valid domains load, the server exits (`SystemExit(1)`)
-- Requesting a sensitive domain without `ENABLE_SENSITIVE_DOMAINS=true` exits immediately
-
-Example: `ENABLED_DOMAINS=timelogs,payroll ENABLE_SENSITIVE_DOMAINS=true`
+Tests for `tools/__init__.py` -- domain loading and tool registration.
 
 ## Security Compliance Checklist
 
@@ -434,13 +416,11 @@ Every tool must comply with these controls. The test suite enforces them automat
 | SEC-05 | Date range caps on bulk operations | `MAX_FILL_DAYS` (31) and `MAX_QUERY_DAYS` (366) in `_constants.py` |
 | SEC-06 | No HTTP redirects | `follow_redirects=False` in `BaseERPClient` |
 | SEC-07 | HTTPS enforcement | `BaseERPClient` rejects non-HTTPS for non-localhost targets |
-| SEC-08 | Sensitive domain gate | `SENSITIVE_DOMAINS` in `tools/__init__.py` requires `ENABLE_SENSITIVE_DOMAINS=true` |
 
 **What this means for you:**
 - Never add an `email` parameter to a tool function -- the test suite will catch it
 - Never include exception details in `ToolError` messages -- use the `@tool_error_handler` decorator
 - If your tool accepts a date range, enforce `MAX_FILL_DAYS` or `MAX_QUERY_DAYS` from `_constants.py`
-- If your domain handles PII/financial data, add it to `SENSITIVE_DOMAINS`
 
 ## Pre-Submit Checklist
 
@@ -470,7 +450,6 @@ Every tool must comply with these controls. The test suite enforces them automat
 - [ ] Field added to `ERPClientRegistry` in `clients/__init__.py`
 - [ ] Tool module `tools/{domain}.py` with `register(mcp)` function
 - [ ] Entry in `AVAILABLE_DOMAINS` in `tools/__init__.py`
-- [ ] Added to `SENSITIVE_DOMAINS` if PII/financial data (SEC-08)
 - [ ] Test files: `tests/test_clients_{domain}.py` and `tests/test_tools_{domain}.py`
 - [ ] Dockerfile updated if new top-level `.py` file added outside `clients/` or `tools/`
 - [ ] README.md tools table updated

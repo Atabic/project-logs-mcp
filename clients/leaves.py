@@ -1,7 +1,7 @@
 """Domain client for ERP leave operations.
 
 Uses composition: holds a reference to :class:`BaseERPClient` for HTTP
-transport and delegates all network I/O through ``self._base._request()``.
+transport and delegates all network I/O through ``self._base.request()``.
 """
 
 from __future__ import annotations
@@ -26,12 +26,14 @@ class LeavesClient:
 
     async def get_choices(self, token: str) -> dict[str, Any]:
         """Get leave types and approver for the user."""
-        return await self._base._request("GET", "leaves/choices/get/", token)
+        return await self._base.request("GET", "leaves/choices/get/", token)
 
     async def get_fiscal_years(self, token: str) -> dict[str, Any]:
         """Get available fiscal years and currently selected fiscal year."""
-        return await self._base._request(
-            "GET", "leaves/individual_leave_fiscal_years/", token,
+        return await self._base.request(
+            "GET",
+            "leaves/individual_leave_fiscal_years/",
+            token,
         )
 
     async def get_summary(self, token: str, selected_year: int) -> dict[str, Any]:
@@ -43,7 +45,7 @@ class LeavesClient:
         Args:
             selected_year: Fiscal year PK to query (required by the ERP backend).
         """
-        return await self._base._request(
+        return await self._base.request(
             "GET",
             "leaves/leave_summary/get/",
             token,
@@ -52,7 +54,7 @@ class LeavesClient:
 
     async def get_month_leaves(self, token: str, year: int, month: int) -> dict[str, Any]:
         """Get approved leaves for a month."""
-        return await self._base._request(
+        return await self._base.request(
             "GET",
             "leaves/person/month_leaves/",
             token,
@@ -61,7 +63,7 @@ class LeavesClient:
 
     async def get_holidays(self, token: str, year: int, month: int) -> dict[str, Any]:
         """Get holidays for a month."""
-        return await self._base._request(
+        return await self._base.request(
             "GET",
             "leaves/holiday_records/",
             token,
@@ -70,7 +72,7 @@ class LeavesClient:
 
     async def list_mine(self, token: str, year: int, month: int) -> dict[str, Any]:
         """List own leaves for a month (all statuses)."""
-        return await self._base._request(
+        return await self._base.request(
             "GET",
             "leaves/list/",
             token,
@@ -79,11 +81,11 @@ class LeavesClient:
 
     async def list_team(self, token: str) -> dict[str, Any]:
         """List team members currently on leave."""
-        return await self._base._request("GET", "leaves/team_leaves/list/", token)
+        return await self._base.request("GET", "leaves/team_leaves/list/", token)
 
     async def list_encashments(self, token: str) -> dict[str, Any]:
         """List own encashment claims."""
-        return await self._base._request("GET", "leaves/person-leave-encashments/", token)
+        return await self._base.request("GET", "leaves/person-leave-encashments/", token)
 
     # -- write methods ------------------------------------------------------
 
@@ -107,11 +109,16 @@ class LeavesClient:
         }
         if half_day_period is not None:
             payload["half_day_period"] = half_day_period
-        return await self._base._request("POST", "leaves/request/apply/", token, data=payload)
+        return await self._base.request("POST", "leaves/request/apply/", token, data=payload)
 
     async def cancel(self, token: str, leave_id: int) -> dict[str, Any]:
         """Cancel a pending leave."""
-        return await self._base._request("POST", f"leaves/delete_leave/{leave_id}/", token)
+        leave_id = int(leave_id)
+        if leave_id <= 0:
+            raise ValueError("leave_id must be a positive integer.")
+        # Ownership check delegated to ERP backend — the user's ERP token
+        # ensures the backend enforces that only the leave owner can cancel.
+        return await self._base.request("POST", f"leaves/delete_leave/{leave_id}/", token)
 
     async def create_encashment(
         self,
@@ -121,6 +128,6 @@ class LeavesClient:
     ) -> dict[str, Any]:
         """Create a leave encashment request."""
         payload = {"leave_type": leave_type, "days": days}
-        return await self._base._request(
+        return await self._base.request(
             "POST", "leaves/person-leave-encashments/", token, data=payload
         )

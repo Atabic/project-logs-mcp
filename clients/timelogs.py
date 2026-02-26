@@ -1,7 +1,7 @@
 """Domain client for ERP time-log operations.
 
 Uses composition: holds a reference to :class:`BaseERPClient` for HTTP
-transport and delegates all network I/O through ``self._base._request()``.
+transport and delegates all network I/O through ``self._base.request()``.
 Static parsing helpers are called via ``BaseERPClient.<method>()``.
 """
 
@@ -28,10 +28,10 @@ class TimelogsClient:
     # -- read methods -------------------------------------------------------
 
     async def get_active_projects(self, token: str) -> dict[str, Any]:
-        return await self._base._request("GET", "project-logs/person/active_project_list/", token)
+        return await self._base.request("GET", "project-logs/person/active_project_list/", token)
 
     async def get_log_labels(self, token: str) -> dict[str, Any]:
-        return await self._base._request("GET", "project-logs/log_labels/", token)
+        return await self._base.request("GET", "project-logs/log_labels/", token)
 
     async def get_week_logs(
         self,
@@ -41,7 +41,7 @@ class TimelogsClient:
         """Fetch the detailed week log for *week_starting* (YYYY-MM-DD)."""
         year = date.fromisoformat(week_starting).year
 
-        list_result = await self._base._request(
+        list_result = await self._base.request(
             "GET", "project-logs/person/list/", token, params={"year": year}
         )
         if list_result["status"] != "success":
@@ -55,9 +55,7 @@ class TimelogsClient:
                 "message": f"Week log not found for week starting {week_starting}",
             }
 
-        return await self._base._request(
-            "GET", f"project-logs/person/get/{week_log_id}/", token
-        )
+        return await self._base.request("GET", f"project-logs/person/get/{week_log_id}/", token)
 
     async def get_day_logs(
         self,
@@ -75,6 +73,8 @@ class TimelogsClient:
         week_data = week_result.get("data", {})
         day_info = BaseERPClient._extract_day(week_data, date_str)
         day_info["week_starting"] = monday.isoformat()
+        # person_id/person_name included intentionally — the authenticated
+        # user's own data, useful for display and cross-referencing.
         day_info["week_log"] = {
             "id": week_data.get("id"),
             "person_id": week_data.get("person_id"),
@@ -100,7 +100,7 @@ class TimelogsClient:
         cursor = start_d
 
         while cursor <= end_d:
-            result = await self._base._request(
+            result = await self._base.request(
                 "GET",
                 "project-logs/person/month-list/",
                 token,
@@ -159,7 +159,7 @@ class TimelogsClient:
         year: int,
         month: int,
     ) -> dict[str, Any]:
-        return await self._base._request(
+        return await self._base.request(
             "GET",
             "project-logs/person/month-list/",
             token,
@@ -188,18 +188,18 @@ class TimelogsClient:
         3. Otherwise fall back to the **Slack endpoint** (POST).
         """
         # Validate project exists in active projects.
-        ap_result = await self._base._request(
+        ap_result = await self._base.request(
             "GET", "project-logs/person/active_project_list/", token
         )
         if ap_result["status"] != "success":
             return ap_result
 
         active_projects = ap_result.get("data", [])
-        nsubteam_id, active_team_name = BaseERPClient._find_active_project(
+        subteam_id, active_team_name = BaseERPClient._find_active_project(
             active_projects, project_id
         )
 
-        if nsubteam_id is None:
+        if subteam_id is None:
             return {
                 "status": "error",
                 "message": (f"Project {project_id} not found in active projects."),
@@ -214,7 +214,7 @@ class TimelogsClient:
         year = monday.year
 
         # Look up existing week log.
-        list_result = await self._base._request(
+        list_result = await self._base.request(
             "GET", "project-logs/person/list/", token, params={"year": year}
         )
 
@@ -247,12 +247,12 @@ class TimelogsClient:
                     "date": date_str,
                     "time_spent": time_str,
                     "description": description,
-                    "subteam": nsubteam_id,
+                    "subteam": subteam_id,
                     "label_id": effective_label,
                 }
             ],
         }
-        slack_result = await self._base._request(
+        slack_result = await self._base.request(
             "POST",
             "project-logs/person/person-week-log-from-slack/",
             token,
@@ -288,7 +288,7 @@ class TimelogsClient:
         monday_str = monday.isoformat()
         year = monday.year
 
-        list_result = await self._base._request(
+        list_result = await self._base.request(
             "GET", "project-logs/person/list/", token, params={"year": year}
         )
         if list_result.get("status") != "success":
@@ -305,7 +305,7 @@ class TimelogsClient:
                 "message": (f"No week log for week starting {monday_str}.  Nothing to delete."),
             }
 
-        get_result = await self._base._request(
+        get_result = await self._base.request(
             "GET", f"project-logs/person/get/{week_log_id}/", token
         )
         if get_result.get("status") != "success":
@@ -319,7 +319,7 @@ class TimelogsClient:
             }
 
         # Resolve active-project team name.
-        ap_result = await self._base._request(
+        ap_result = await self._base.request(
             "GET", "project-logs/person/active_project_list/", token
         )
         active_team_name: str | None = None
@@ -358,7 +358,7 @@ class TimelogsClient:
         else:
             task["days"] = new_days
 
-        save_result = await self._base._request(
+        save_result = await self._base.request(
             "PATCH",
             f"project-logs/person/person-week-log/save/{week_log_id}/",
             token,
@@ -379,7 +379,7 @@ class TimelogsClient:
         save_draft: bool = False,
     ) -> dict[str, Any]:
         year = date.fromisoformat(week_starting).year
-        list_result = await self._base._request(
+        list_result = await self._base.request(
             "GET", "project-logs/person/list/", token, params={"year": year}
         )
         if list_result.get("status") != "success":
@@ -393,7 +393,7 @@ class TimelogsClient:
                 "message": (f"Week log not found for week starting {week_starting}"),
             }
 
-        return await self._base._request(
+        return await self._base.request(
             "PATCH",
             f"project-logs/person/person-week-log/complete/{week_log_id}/",
             token,
@@ -411,7 +411,11 @@ class TimelogsClient:
         label_id: int | None = None,
         skip_weekends: bool = False,
     ) -> dict[str, Any]:
-        """Batch-create logs.  SEC-05: capped at 31 days."""
+        """Batch-create logs.  SEC-05: capped at 31 days.
+
+        This operation is idempotent — re-running for the same dates updates
+        existing entries rather than creating duplicates (upsert semantics).
+        """
         start = date.fromisoformat(start_date)
         end = date.fromisoformat(end_date)
 
@@ -502,17 +506,15 @@ class TimelogsClient:
 
         week_data = week_result.get("data", {})
         projects = week_data.get("projects", [])
-        project_id_int = int(project_id)
-
         for project in projects:
             try:
-                if int(project.get("id", -1)) == project_id_int:
+                if int(project.get("id", -1)) == project_id:
                     return {
                         "status": "success",
                         "exists": True,
                         "person_week_project_id": project.get("id"),
                         "week_starting": monday_str,
-                        "project_id": project_id_int,
+                        "project_id": project_id,
                         "message": "PersonWeekProject exists.",
                     }
             except (ValueError, TypeError):
@@ -522,7 +524,7 @@ class TimelogsClient:
             "status": "success",
             "exists": False,
             "week_starting": monday_str,
-            "project_id": project_id_int,
+            "project_id": project_id,
             "message": "PersonWeekProject does not exist.",
         }
 
@@ -634,7 +636,7 @@ class TimelogsClient:
         monday_str: str,
     ) -> dict[str, Any]:
         """Upsert a log entry via the Save API (PATCH)."""
-        get_result = await self._base._request(
+        get_result = await self._base.request(
             "GET", f"project-logs/person/get/{week_log_id}/", token
         )
         if get_result.get("status") != "success":
@@ -647,9 +649,7 @@ class TimelogsClient:
                 "message": "Week log data missing modified_at.",
             }
 
-        project_data = BaseERPClient._match_project_in_week_log(
-            week_log_data, active_team_name
-        )
+        project_data = BaseERPClient._match_project_in_week_log(week_log_data, active_team_name)
         if project_data is None:
             return {
                 "status": "error",
@@ -702,7 +702,7 @@ class TimelogsClient:
             }
             project_data.setdefault("tasks", []).append(new_task)
 
-        return await self._base._request(
+        return await self._base.request(
             "PATCH",
             f"project-logs/person/person-week-log/save/{week_log_id}/",
             token,

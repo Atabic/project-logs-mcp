@@ -308,19 +308,19 @@ class TestExchangeGoogleToken:
 
 
 # =========================================================================
-# _request tests
+# request tests
 # =========================================================================
 
 
 class TestRequest:
-    """Tests for the generic _request helper."""
+    """Tests for the generic request helper."""
 
     @respx.mock
     async def test_success_returns_data(self, client: BaseERPClient) -> None:
         respx.get(f"{BASE_URL}/some/endpoint/").mock(
             return_value=httpx.Response(200, json={"foo": "bar"})
         )
-        result = await client._request("GET", "some/endpoint/", "my-token")
+        result = await client.request("GET", "some/endpoint/", "my-token")
         assert result["status"] == "success"
         assert result["data"] == {"foo": "bar"}
 
@@ -329,17 +329,17 @@ class TestRequest:
         respx.get(f"{BASE_URL}/fail/").mock(
             return_value=httpx.Response(403, json={"detail": "Forbidden"})
         )
-        result = await client._request("GET", "fail/", "tok")
+        result = await client.request("GET", "fail/", "tok")
         assert result["status"] == "error"
         assert result["status_code"] == 403
-        assert "Forbidden" in result["message"]
+        assert result["message"] == "ERP request failed with status 403."
 
     @respx.mock
     async def test_5xx_returns_error_dict(self, client: BaseERPClient) -> None:
         respx.get(f"{BASE_URL}/crash/").mock(
             return_value=httpx.Response(500, json={"error": "Internal"})
         )
-        result = await client._request("GET", "crash/", "tok")
+        result = await client.request("GET", "crash/", "tok")
         assert result["status"] == "error"
         assert result["status_code"] == 500
 
@@ -349,7 +349,7 @@ class TestRequest:
         respx.get(f"{BASE_URL}/err/").mock(
             return_value=httpx.Response(500, json={"error": "boom"})
         )
-        result = await client._request("GET", "err/", "tok")
+        result = await client.request("GET", "err/", "tok")
         result_str = str(result)
         assert "Traceback" not in result_str
         assert "traceback" not in result
@@ -357,7 +357,7 @@ class TestRequest:
     @respx.mock
     async def test_auth_header_sent(self, client: BaseERPClient) -> None:
         route = respx.get(f"{BASE_URL}/check/").mock(return_value=httpx.Response(200, json={}))
-        await client._request("GET", "check/", "my-secret-token")
+        await client.request("GET", "check/", "my-secret-token")
         sent_headers = route.calls.last.request.headers
         assert sent_headers["authorization"] == "Token my-secret-token"
 
@@ -366,7 +366,7 @@ class TestRequest:
         respx.get(f"{BASE_URL}/timeout/").mock(
             side_effect=httpx.ConnectError("Connection refused")
         )
-        result = await client._request("GET", "timeout/", "tok")
+        result = await client.request("GET", "timeout/", "tok")
         assert result["status"] == "error"
         assert result["message"] == "ERP service temporarily unavailable."
 
@@ -394,9 +394,7 @@ class TestFindWeekLogId:
     def test_nested_dict_search(self) -> None:
         """Recursively search nested structures."""
         data: dict[str, Any] = {
-            "person_week_logs": [
-                {"months_log": [{"id": 50, "week_starting": "2026-03-02"}]}
-            ]
+            "person_week_logs": [{"months_log": [{"id": 50, "week_starting": "2026-03-02"}]}]
         }
         assert BaseERPClient._find_week_log_id(data, "2026-03-02") == 50
 

@@ -10,7 +10,7 @@ Security controls implemented:
     SEC-01  No ``email`` parameter on data-query methods.
     SEC-02  Domain restriction in ``exchange_google_token``.
     SEC-03  SHA-256 hashed cache keys with bounded LRU eviction (500 entries).
-    SEC-04  ``_request`` returns error dicts for 4xx/5xx -- never raises.
+    SEC-04  ``request`` returns error dicts for 4xx/5xx -- never raises.
     SEC-06  ``httpx.AsyncClient(follow_redirects=False)``.
     SEC-07  Constructor rejects non-HTTPS base_url for non-localhost targets.
 """
@@ -130,6 +130,7 @@ class TTLCache[T]:
         self._data.clear()
 
     def __len__(self) -> int:
+        # NOTE: Approximate count — not async-safe. For debugging/logging only.
         """Return count of non-expired entries (read-only, no eviction)."""
         now = time.monotonic()
         return sum(1 for _, exp in self._data.values() if exp > now)
@@ -231,74 +232,66 @@ class BaseERPClient:
 
         # Per-key lock: coalesce concurrent exchanges for the same google_token
         # so only the first caller does the HTTP round-trip.
-        if cache_key not in self._exchange_locks:
-            self._exchange_locks[cache_key] = asyncio.Lock()
-        lock = self._exchange_locks[cache_key]
+        lock = self._exchange_locks.setdefault(cache_key, asyncio.Lock())
 
-        try:
-            async with lock:
-                # Re-check cache: another coroutine may have populated it while we waited.
-                cached = await self._token_cache.aget(cache_key)
-                if cached is not None:
-                    return cached
+        async with lock:
+            # Re-check cache: another coroutine may have populated it while we waited.
+            cached = await self._token_cache.aget(cache_key)
+            if cached is not None:
+                return cached
 
-                # Call ERP backend (no auth header for login endpoints).
-                url = f"{self._base_url}/core/google-login/"
-                try:
-                    response = await self._http.post(
-                        url,
-                        json={"platform": "google", "access_token": google_token},
-                        headers={
-                            "Content-Type": "application/json",
-                            "Accept": "application/json",
-                        },
-                    )
-                except httpx.TransportError as exc:
-                    raise ConnectionError(f"Google token exchange failed: {exc}") from exc
+            # Call ERP backend (no auth header for login endpoints).
+            url = f"{self._base_url}/core/google-login/"
+            try:
+                response = await self._http.post(
+                    url,
+                    json={"platform": "google", "access_token": google_token},
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                )
+            except httpx.TransportError as exc:
+                raise ConnectionError(f"Google token exchange failed: {exc}") from exc
 
-                if response.status_code >= 400:
-                    raise ValueError(f"Google token exchange failed (HTTP {response.status_code})")
+            if response.status_code >= 400:
+                raise ValueError(f"Google token exchange failed (HTTP {response.status_code})")
 
-                try:
-                    data = response.json()
-                except (json.JSONDecodeError, ValueError) as exc:
-                    raise ValueError("ERP backend returned invalid JSON response") from exc
-                erp_token: str | None = data.get("token")
-                email: str | None = data.get("email")
+            try:
+                data = response.json()
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise ValueError("ERP backend returned invalid JSON response") from exc
+            erp_token: str | None = data.get("token")
+            email: str | None = data.get("email")
 
-                if not erp_token:
-                    raise ValueError("Backend did not return a token")
-                if not email:
-                    raise ValueError("Backend did not return an email")
+            if not erp_token:
+                raise ValueError("Backend did not return a token")
+            if not email:
+                raise ValueError("Backend did not return an email")
 
-                # Validate token format before caching.
-                if not re.match(r'^[a-zA-Z0-9_.\-]{10,512}$', erp_token):
-                    raise ValueError(
-                        f"ERP backend returned invalid token format (length={len(erp_token)})"
-                    )
+            # Validate token format before caching.
+            if not re.match(r"^[a-zA-Z0-9_.\-]{10,512}$", erp_token):
+                raise ValueError(
+                    f"ERP backend returned invalid token format (length={len(erp_token)})"
+                )
 
-                # SEC-02: domain restriction.
-                if "@" not in email:
-                    raise ValueError("Backend returned email without '@' symbol")
-                domain = email.rsplit("@", 1)[-1].lower().strip()
-                if domain != self._allowed_domain:
-                    raise ValueError(
-                        f"Email domain '{domain}' is not allowed.  "
-                        f"Only @{self._allowed_domain} accounts may authenticate."
-                    )
+            # SEC-02: domain restriction.
+            if "@" not in email:
+                raise ValueError("Backend returned email without '@' symbol")
+            domain = email.rsplit("@", 1)[-1].lower().strip()
+            if domain != self._allowed_domain:
+                raise ValueError(
+                    f"Email domain '{domain}' is not allowed.  "
+                    f"Only @{self._allowed_domain} accounts may authenticate."
+                )
 
-                result = (erp_token, email)
-                await self._token_cache.aput(cache_key, result)
-                return result
-        finally:
-            # Clean up the per-key lock if no other coroutine is waiting on it,
-            # preventing unbounded growth of _exchange_locks.
-            if not lock.locked():
-                self._exchange_locks.pop(cache_key, None)
+            result = (erp_token, email)
+            await self._token_cache.aput(cache_key, result)
+            return result
 
     # -- generic request helper ---------------------------------------------
 
-    async def _request(
+    async def request(
         self,
         method: str,
         endpoint: str,
@@ -352,10 +345,19 @@ class BaseERPClient:
             }
 
         # Parse response body.
-        try:
-            response_data = response.json()
-        except (json.JSONDecodeError, ValueError):
-            response_data = {"text": response.text[:500]}
+        content_length = int(response.headers.get("content-length", "0"))
+        if content_length > 1_000_000:  # 1MB guard
+            response_data = {}
+        else:
+            try:
+                response_data = response.json()
+            except Exception:
+                logger.warning(
+                    "Non-JSON response from ERP (status %s): %s",
+                    response.status_code,
+                    response.text[:500],
+                )
+                response_data = {}
 
         if response.status_code >= 400:
             logger.warning(
@@ -364,16 +366,18 @@ class BaseERPClient:
                 endpoint,
                 response.status_code,
             )
-            error_msg = "API error"
+            # Log the specific backend error for debugging
+            raw_error = ""
             if isinstance(response_data, dict):
-                error_msg = (
-                    response_data.get("error")
-                    or response_data.get("detail")
-                    or f"API error: {response.status_code}"
+                raw_error = response_data.get("error") or response_data.get("detail") or ""
+            if raw_error:
+                logger.warning(
+                    "ERP backend error (status %s): %s",
+                    response.status_code,
+                    str(raw_error)[:500],
                 )
-            error_msg = str(error_msg)
-            if len(error_msg) > 500:
-                error_msg = error_msg[:500] + "..."
+            # Return generic message to client (SEC-04)
+            error_msg = f"ERP request failed with status {response.status_code}."
             return {
                 "status": "error",
                 "message": error_msg,
@@ -516,8 +520,8 @@ class BaseERPClient:
                         task_info = {
                             "id": task.get("id"),
                             "description": task.get("description", ""),
-                            "hours": int(day.get("hours", 0)),
-                            "minutes": int(day.get("minutes", 0)),
+                            "hours": round(float(day.get("hours", 0))),
+                            "minutes": round(float(day.get("minutes", 0))),
                             "decimal_hours": float(day.get("decimal_hours", 0)),
                             "label_id": day.get("label"),
                             "label_option": day.get("label_option"),

@@ -47,4 +47,8 @@ def load_domains(mcp: FastMCP) -> list[str]:
         loaded.append(domain)
         logger.info("Loaded domain: %s", domain)
 
+    if len(loaded) < len(AVAILABLE_DOMAINS):
+        failed = set(AVAILABLE_DOMAINS) - set(loaded)
+        logger.error("Failed to load domain modules: %s", ", ".join(sorted(failed)))
+
     return loaded

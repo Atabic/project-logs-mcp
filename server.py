@@ -42,9 +42,7 @@ logging.basicConfig(
 # Configuration
 # ---------------------------------------------------------------------------
 
-ERP_BASE_URL: str = os.environ.get(
-    "ERP_API_BASE_URL", "https://erp.arbisoft.com/api/v1/"
-)
+ERP_BASE_URL: str = os.environ.get("ERP_API_BASE_URL", "https://erp.arbisoft.com/api/v1/")
 
 try:
     _APP_VERSION: str = importlib.metadata.version("erp-mcp")
@@ -75,9 +73,7 @@ auth = GoogleProvider(
 async def _lifespan(server: FastMCP) -> AsyncIterator[None]:
     """Manage application resources during server lifecycle."""
     if not _google_client_id or not _google_client_secret:
-        logger.critical(
-            "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are not set — refusing to start"
-        )
+        logger.critical("GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are not set — refusing to start")
         raise SystemExit(1)
     base = BaseERPClient(base_url=ERP_BASE_URL, allowed_domain=ALLOWED_DOMAIN)
     registry = ERPClientRegistry(base=base)
@@ -108,6 +104,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Cache-Control"] = "no-store"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Content-Security-Policy"] = "default-src 'none'"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         return response
 
 
@@ -123,7 +121,7 @@ _security_middleware = Middleware(SecurityHeadersMiddleware)
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request: Request) -> JSONResponse:
     """Return 200 OK for Docker health checks and load balancers."""
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "ok", "version": _APP_VERSION})
 
 
 # ---------------------------------------------------------------------------

@@ -7,66 +7,17 @@ and mocked ``get_access_token``.  We never hit real Google or ERP APIs.
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth import AccessToken
 
-import server as server_module
 from clients import set_registry
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _get_tool_fn(name: str):
-    """Get a registered tool's underlying async function."""
-    from fastmcp.tools.function_tool import FunctionTool
-
-    lp = server_module.mcp.local_provider
-    for comp in lp._components.values():
-        if isinstance(comp, FunctionTool) and comp.name == name:
-            return comp.fn
-    available = sorted(
-        comp.name for comp in lp._components.values() if isinstance(comp, FunctionTool)
-    )
-    raise KeyError(f"Tool {name!r} not found. Available: {available}")
-
-
-def _make_access_token(
-    *,
-    email: str = "user@arbisoft.com",
-    hd: str = "arbisoft.com",
-    token: str = "google-access-token-xyz",
-) -> AccessToken:
-    """Build a fake ``AccessToken`` with the claims structure GoogleProvider produces."""
-    return AccessToken(
-        token=token,
-        client_id="test-client-id",
-        scopes=["openid"],
-        expires_at=int(time.time()) + 3600,
-        claims={
-            "sub": "1234567890",
-            "email": email,
-            "name": "Test User",
-            "picture": None,
-            "given_name": "Test",
-            "family_name": "User",
-            "locale": "en",
-            "google_user_data": {"hd": hd, "email": email},
-            "google_token_info": {},
-        },
-    )
-
-
-def _patch_token(token: AccessToken | None):
-    """Shorthand for patching ``get_access_token`` in the _auth module."""
-    return patch("_auth.get_access_token", return_value=token)
-
+from tests.conftest import get_tool_fn as _get_tool_fn
+from tests.conftest import make_access_token as _make_access_token
+from tests.conftest import patch_token as _patch_token
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -276,7 +227,7 @@ class TestTimelogsGetDay:
         fn = _get_tool_fn("timelogs_get_day")
         set_registry(mock_registry)
         with _patch_token(valid_token):
-            result = await fn(date_str="2024-01-10")
+            result = await fn(date="2024-01-10")
 
         mock_timelogs.get_day_logs.assert_awaited_once_with("erp-token-abc", "2024-01-10")
         assert result["status"] == "success"
@@ -698,7 +649,7 @@ class TestTimelogsFillDays:
         fn = _get_tool_fn("timelogs_fill_days")
         set_registry(mock_registry)
         with _patch_token(valid_token):
-            with pytest.raises(ToolError, match="Invalid date format"):
+            with pytest.raises(ToolError, match="YYYY-MM-DD format"):
                 await fn(
                     start_date="not-a-date",
                     end_date="2024-01-10",

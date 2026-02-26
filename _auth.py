@@ -24,6 +24,8 @@ R = TypeVar("R")
 
 def check_erp_result(result: dict[str, Any]) -> dict[str, Any]:
     """Raise ToolError if ERPClient returned an error dict."""
+    # Defensive guard: API responses should always be dicts, but this
+    # protects against unexpected response shapes from the ERP backend.
     if isinstance(result, dict) and result.get("status") == "error":
         raise ToolError(result.get("message", "ERP operation failed"))
     return result

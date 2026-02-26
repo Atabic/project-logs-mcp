@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 from datetime import date as date_type
 from typing import Any
 
@@ -16,6 +18,14 @@ from clients import get_registry
 logger = logging.getLogger("erp_mcp.server")
 
 __all__ = ["register"]
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _validate_date_str(value: str, name: str = "date") -> None:
+    """Validate that *value* is strictly YYYY-MM-DD (no ISO week dates)."""
+    if not _DATE_RE.match(value):
+        raise ToolError(f"{name} must be in YYYY-MM-DD format, got: {value!r}")
 
 
 def register(mcp: FastMCP) -> None:
@@ -47,30 +57,28 @@ def register(mcp: FastMCP) -> None:
         Args:
             week_starting: Week starting date in YYYY-MM-DD format (must be a Monday).
         """
+        _validate_date_str(week_starting, "week_starting")
         d = date_type.fromisoformat(week_starting)
         if d.weekday() != 0:
             raise ToolError(
                 f"week_starting must be a Monday, got {week_starting} ({d.strftime('%A')})"
             )
         token, _email = await get_erp_token()
-        return check_erp_result(
-            await get_registry().timelogs.get_week_logs(token, week_starting)
-        )
+        return check_erp_result(await get_registry().timelogs.get_week_logs(token, week_starting))
 
     @mcp.tool
     @tool_error_handler("Failed to fetch day logs. Please try again.")
-    async def timelogs_get_day(date_str: str) -> dict[str, Any]:
+    async def timelogs_get_day(date: str) -> dict[str, Any]:
         """Get detailed project logs for a specific day.
 
         Returns all projects, tasks, and time logged for that day.
 
         Args:
-            date_str: Date in YYYY-MM-DD format.
+            date: Date in YYYY-MM-DD format.
         """
+        _validate_date_str(date, "date")
         token, _email = await get_erp_token()
-        return check_erp_result(
-            await get_registry().timelogs.get_day_logs(token, date_str)
-        )
+        return check_erp_result(await get_registry().timelogs.get_day_logs(token, date))
 
     @mcp.tool
     @tool_error_handler("Failed to fetch logs for date range. Please try again.")
@@ -85,13 +93,13 @@ def register(mcp: FastMCP) -> None:
             end_date: End date in YYYY-MM-DD format.
         """
         # Validate and cap date range
+        _validate_date_str(start_date, "start_date")
+        _validate_date_str(end_date, "end_date")
         try:
             start = date_type.fromisoformat(start_date)
             end = date_type.fromisoformat(end_date)
         except ValueError as exc:
-            raise ValueError(
-                f"Invalid date format. Use YYYY-MM-DD. Details: {exc}"
-            ) from exc
+            raise ValueError("Invalid date format. Use YYYY-MM-DD.") from exc
         if end < start:
             raise ValueError("end_date must be on or after start_date.")
         day_span = (end - start).days + 1
@@ -103,9 +111,7 @@ def register(mcp: FastMCP) -> None:
 
         token, _email = await get_erp_token()
         return check_erp_result(
-            await get_registry().timelogs.get_logs_for_date_range(
-                token, start_date, end_date
-            )
+            await get_registry().timelogs.get_logs_for_date_range(token, start_date, end_date)
         )
 
     @mcp.tool
@@ -118,9 +124,7 @@ def register(mcp: FastMCP) -> None:
             month: Month number (1-12).
         """
         token, _email = await get_erp_token()
-        return check_erp_result(
-            await get_registry().timelogs.get_month_logs(token, year, month)
-        )
+        return check_erp_result(await get_registry().timelogs.get_month_logs(token, year, month))
 
     # ------------------------------------------------------------------
     # Write tools
@@ -151,28 +155,23 @@ def register(mcp: FastMCP) -> None:
             label_id: Label ID (from get_log_labels). Use this or label_name.
             label_name: Label name (e.g. 'Coding'). Resolved automatically.
         """
+        _validate_date_str(date, "date")
+        if project_id is None and project_name is None:
+            raise ToolError("Provide either project_id or project_name.")
         if project_id is not None and project_name is not None:
             raise ToolError("Provide either project_id or project_name, not both.")
         if len(description) > MAX_DESCRIPTION_LEN:
-            raise ToolError(
-                f"Description too long (max {MAX_DESCRIPTION_LEN} characters)"
-            )
+            raise ToolError(f"Description too long (max {MAX_DESCRIPTION_LEN} characters)")
         if hours <= 0 or hours > 24:
             raise ValueError(
                 f"hours must be between 0 (exclusive) and 24 (inclusive), got {hours}"
             )
         if round(hours * 60) < 1:
-            raise ToolError(
-                "Hours too small: rounds to 0 minutes. Minimum is ~0.02 (1 minute)."
-            )
+            raise ToolError("Hours too small: rounds to 0 minutes. Minimum is ~0.02 (1 minute).")
         token, email = await get_erp_token()
         client = get_registry().timelogs
-        resolved_project_id = await client.resolve_project_id(
-            token, project_id, project_name
-        )
-        resolved_label_id = await client.resolve_label_id(
-            token, label_id, label_name
-        )
+        resolved_project_id = await client.resolve_project_id(token, project_id, project_name)
+        resolved_label_id = await client.resolve_label_id(token, label_id, label_name)
         result = check_erp_result(
             await client.create_or_update_log(
                 token,
@@ -211,17 +210,16 @@ def register(mcp: FastMCP) -> None:
             project_id: Project/subteam ID (from get_active_projects). Use this or project_name.
             project_name: Project/team name. Resolved automatically.
         """
+        _validate_date_str(date, "date")
+        if project_id is None and project_name is None:
+            raise ToolError("Provide either project_id or project_name.")
         if project_id is not None and project_name is not None:
             raise ToolError("Provide either project_id or project_name, not both.")
         if len(description) > MAX_DESCRIPTION_LEN:
-            raise ToolError(
-                f"Description too long (max {MAX_DESCRIPTION_LEN} characters)"
-            )
+            raise ToolError(f"Description too long (max {MAX_DESCRIPTION_LEN} characters)")
         token, email = await get_erp_token()
         client = get_registry().timelogs
-        resolved_project_id = await client.resolve_project_id(
-            token, project_id, project_name
-        )
+        resolved_project_id = await client.resolve_project_id(token, project_id, project_name)
         result = check_erp_result(
             await client.delete_log(
                 token,
@@ -250,6 +248,7 @@ def register(mcp: FastMCP) -> None:
             week_starting: Week starting date in YYYY-MM-DD format (must be a Monday).
             save_draft: If true, saves as draft without completing. Default is false.
         """
+        _validate_date_str(week_starting, "week_starting")
         d = date_type.fromisoformat(week_starting)
         if d.weekday() != 0:
             raise ToolError(
@@ -298,29 +297,27 @@ def register(mcp: FastMCP) -> None:
             label_name: Label name. Resolved automatically.
             skip_weekends: Skip Saturday and Sunday. Default is false.
         """
+        _validate_date_str(start_date, "start_date")
+        _validate_date_str(end_date, "end_date")
+        if project_id is None and project_name is None:
+            raise ToolError("Provide either project_id or project_name.")
         if project_id is not None and project_name is not None:
             raise ToolError("Provide either project_id or project_name, not both.")
         if len(description) > MAX_DESCRIPTION_LEN:
-            raise ToolError(
-                f"Description too long (max {MAX_DESCRIPTION_LEN} characters)"
-            )
+            raise ToolError(f"Description too long (max {MAX_DESCRIPTION_LEN} characters)")
         if hours_per_day <= 0 or hours_per_day > 24:
             raise ValueError(
                 f"hours_per_day must be between 0 (exclusive) and 24 (inclusive), "
                 f"got {hours_per_day}"
             )
         if round(hours_per_day * 60) < 1:
-            raise ToolError(
-                "Hours too small: rounds to 0 minutes. Minimum is ~0.02 (1 minute)."
-            )
+            raise ToolError("Hours too small: rounds to 0 minutes. Minimum is ~0.02 (1 minute).")
         # --- SEC-05: 31-day cap ---
         try:
             start = date_type.fromisoformat(start_date)
             end = date_type.fromisoformat(end_date)
         except ValueError as exc:
-            raise ValueError(
-                f"Invalid date format. Use YYYY-MM-DD. Details: {exc}"
-            ) from exc
+            raise ValueError("Invalid date format. Use YYYY-MM-DD.") from exc
 
         day_count = (end - start).days + 1
         if day_count > MAX_FILL_DAYS:
@@ -333,24 +330,28 @@ def register(mcp: FastMCP) -> None:
 
         token, email = await get_erp_token()
         client = get_registry().timelogs
-        resolved_project_id = await client.resolve_project_id(
-            token, project_id, project_name
-        )
-        resolved_label_id = await client.resolve_label_id(
-            token, label_id, label_name
-        )
-        result = check_erp_result(
-            await client.fill_logs_for_days(
-                token,
-                start_date=start_date,
-                end_date=end_date,
-                project_id=resolved_project_id,
-                description=description,
-                hours_per_day=hours_per_day,
-                label_id=resolved_label_id,
-                skip_weekends=skip_weekends,
+        resolved_project_id = await client.resolve_project_id(token, project_id, project_name)
+        resolved_label_id = await client.resolve_label_id(token, label_id, label_name)
+        try:
+            result = check_erp_result(
+                await asyncio.wait_for(
+                    client.fill_logs_for_days(
+                        token,
+                        start_date=start_date,
+                        end_date=end_date,
+                        project_id=resolved_project_id,
+                        description=description,
+                        hours_per_day=hours_per_day,
+                        label_id=resolved_label_id,
+                        skip_weekends=skip_weekends,
+                    ),
+                    timeout=300.0,  # 5 minutes
+                )
             )
-        )
+        except TimeoutError:
+            raise ToolError(
+                "Fill operation timed out after 5 minutes. Try a smaller date range."
+            ) from None
         logger.info(
             "WRITE_OP tool=timelogs_fill_days user=%s start=%s end=%s project_id=%s days=%s",
             email,
@@ -383,15 +384,14 @@ def register(mcp: FastMCP) -> None:
             project_id: Project/subteam ID. Use this or project_name.
             project_name: Project/team name. Resolved automatically.
         """
+        _validate_date_str(date, "date")
+        if project_id is None and project_name is None:
+            raise ToolError("Provide either project_id or project_name.")
         if project_id is not None and project_name is not None:
             raise ToolError("Provide either project_id or project_name, not both.")
         token, _email = await get_erp_token()
         client = get_registry().timelogs
-        resolved_project_id = await client.resolve_project_id(
-            token, project_id, project_name
-        )
+        resolved_project_id = await client.resolve_project_id(token, project_id, project_name)
         return check_erp_result(
-            await client.check_person_week_project_exists(
-                token, date, resolved_project_id
-            )
+            await client.check_person_week_project_exists(token, date, resolved_project_id)
         )

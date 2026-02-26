@@ -263,9 +263,7 @@ class TestCreateOrUpdateLog:
     """Tests for the Save API vs Slack endpoint fallback logic."""
 
     @respx.mock
-    async def test_slack_fallback_when_no_week_log(
-        self, timelogs_client: TimelogsClient
-    ) -> None:
+    async def test_slack_fallback_when_no_week_log(self, timelogs_client: TimelogsClient) -> None:
         """When no week log exists, should POST to Slack endpoint."""
         respx.get(f"{BASE_URL}/project-logs/person/active_project_list/").mock(
             return_value=httpx.Response(200, json=[{"id": 42, "team": "My Project"}])
@@ -288,9 +286,7 @@ class TestCreateOrUpdateLog:
         assert slack_route.called
 
     @respx.mock
-    async def test_save_api_when_week_log_exists(
-        self, timelogs_client: TimelogsClient
-    ) -> None:
+    async def test_save_api_when_week_log_exists(self, timelogs_client: TimelogsClient) -> None:
         """When week log exists, should PATCH via Save API."""
         respx.get(f"{BASE_URL}/project-logs/person/active_project_list/").mock(
             return_value=httpx.Response(200, json=[{"id": 42, "team": "My Project"}])
@@ -319,9 +315,9 @@ class TestCreateOrUpdateLog:
                 },
             )
         )
-        save_route = respx.patch(
-            f"{BASE_URL}/project-logs/person/person-week-log/save/999/"
-        ).mock(return_value=httpx.Response(200, json={"saved": True}))
+        save_route = respx.patch(f"{BASE_URL}/project-logs/person/person-week-log/save/999/").mock(
+            return_value=httpx.Response(200, json={"saved": True})
+        )
 
         result = await timelogs_client.create_or_update_log(
             token="tok",
@@ -334,9 +330,7 @@ class TestCreateOrUpdateLog:
         assert save_route.called
 
     @respx.mock
-    async def test_project_not_in_active_projects(
-        self, timelogs_client: TimelogsClient
-    ) -> None:
+    async def test_project_not_in_active_projects(self, timelogs_client: TimelogsClient) -> None:
         respx.get(f"{BASE_URL}/project-logs/person/active_project_list/").mock(
             return_value=httpx.Response(200, json=[{"id": 1, "team": "Other"}])
         )
@@ -355,9 +349,7 @@ class TestSaveApiUpsertNewDay:
     """Test that _save_api_upsert correctly appends a new day to an existing task."""
 
     @respx.mock
-    async def test_appends_new_day_to_existing_task(
-        self, timelogs_client: TimelogsClient
-    ) -> None:
+    async def test_appends_new_day_to_existing_task(self, timelogs_client: TimelogsClient) -> None:
         """When a task already exists but not the target date, a new day should be appended."""
         week_log_id = 100
         existing_week_log = {
@@ -442,9 +434,9 @@ class TestSaveApiUpsert:
                 },
             )
         )
-        save_route = respx.patch(
-            f"{BASE_URL}/project-logs/person/person-week-log/save/999/"
-        ).mock(return_value=httpx.Response(200, json={"saved": True}))
+        save_route = respx.patch(f"{BASE_URL}/project-logs/person/person-week-log/save/999/").mock(
+            return_value=httpx.Response(200, json={"saved": True})
+        )
 
         result = await timelogs_client._save_api_upsert(
             token="tok",
@@ -491,9 +483,9 @@ class TestSaveApiUpsert:
                 },
             )
         )
-        save_route = respx.patch(
-            f"{BASE_URL}/project-logs/person/person-week-log/save/999/"
-        ).mock(return_value=httpx.Response(200, json={"saved": True}))
+        save_route = respx.patch(f"{BASE_URL}/project-logs/person/person-week-log/save/999/").mock(
+            return_value=httpx.Response(200, json={"saved": True})
+        )
 
         result = await timelogs_client._save_api_upsert(
             token="tok",
@@ -544,9 +536,7 @@ class TestDeleteLog:
     @respx.mock
     async def test_delete_removes_day_entry(self, timelogs_client: TimelogsClient) -> None:
         respx.get(f"{BASE_URL}/project-logs/person/list/").mock(
-            return_value=httpx.Response(
-                200, json=[{"id": 100, "week_starting": "2026-01-05"}]
-            )
+            return_value=httpx.Response(200, json=[{"id": 100, "week_starting": "2026-01-05"}])
         )
         respx.get(f"{BASE_URL}/project-logs/person/get/100/").mock(
             return_value=httpx.Response(
@@ -590,9 +580,7 @@ class TestDeleteLog:
     async def test_delete_preserves_other_days(self, timelogs_client: TimelogsClient) -> None:
         """Deleting a day entry should keep other days for the same task."""
         respx.get(f"{BASE_URL}/project-logs/person/list/").mock(
-            return_value=httpx.Response(
-                200, json=[{"id": 100, "week_starting": "2026-01-05"}]
-            )
+            return_value=httpx.Response(200, json=[{"id": 100, "week_starting": "2026-01-05"}])
         )
         respx.get(f"{BASE_URL}/project-logs/person/get/100/").mock(
             return_value=httpx.Response(
@@ -621,9 +609,9 @@ class TestDeleteLog:
         respx.get(f"{BASE_URL}/project-logs/person/active_project_list/").mock(
             return_value=httpx.Response(200, json=[{"id": 42, "team": "Proj"}])
         )
-        save_route = respx.patch(
-            f"{BASE_URL}/project-logs/person/person-week-log/save/100/"
-        ).mock(return_value=httpx.Response(200, json={"saved": True}))
+        save_route = respx.patch(f"{BASE_URL}/project-logs/person/person-week-log/save/100/").mock(
+            return_value=httpx.Response(200, json={"saved": True})
+        )
 
         result = await timelogs_client.delete_log(
             token="tok",
@@ -648,9 +636,7 @@ class TestCompleteWeekLog:
     @respx.mock
     async def test_complete_patches_endpoint(self, timelogs_client: TimelogsClient) -> None:
         respx.get(f"{BASE_URL}/project-logs/person/list/").mock(
-            return_value=httpx.Response(
-                200, json=[{"id": 50, "week_starting": "2026-01-05"}]
-            )
+            return_value=httpx.Response(200, json=[{"id": 50, "week_starting": "2026-01-05"}])
         )
         complete_route = respx.patch(
             f"{BASE_URL}/project-logs/person/person-week-log/complete/50/"

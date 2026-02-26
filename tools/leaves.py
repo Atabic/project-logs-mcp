@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 from datetime import date as date_type
 from typing import Any
 
@@ -10,12 +12,21 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 from _auth import check_erp_result, get_erp_token, tool_error_handler
-from _constants import MAX_LEAVE_DAYS, MAX_LEAVE_REASON_LEN
+from _constants import MAX_ENCASHMENT_DAYS, MAX_LEAVE_DAYS, MAX_LEAVE_REASON_LEN
 from clients import get_registry
 
 logger = logging.getLogger("erp_mcp.server")
 
 __all__ = ["register"]
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_VALID_HALF_DAY_PERIODS = {"first_half", "second_half"}
+
+
+def _validate_date_str(value: str, name: str = "date") -> None:
+    """Validate that *value* is strictly YYYY-MM-DD (no ISO week dates)."""
+    if not _DATE_RE.match(value):
+        raise ToolError(f"{name} must be in YYYY-MM-DD format, got: {value!r}")
 
 
 def register(mcp: FastMCP) -> None:
@@ -58,6 +69,7 @@ def register(mcp: FastMCP) -> None:
             fy_result = check_erp_result(await client.get_fiscal_years(token))
             fiscal_year_id = fy_result.get("data", {}).get("selected_fiscal_year")
             if fiscal_year_id is None:
+                logger.debug("Fiscal year auto-resolution failed. fy_result=%s", fy_result)
                 raise ToolError("No active fiscal year found.")
         return check_erp_result(await client.get_summary(token, fiscal_year_id))
 
@@ -72,8 +84,10 @@ def register(mcp: FastMCP) -> None:
         """
         token, _email = await get_erp_token()
         client = get_registry().leaves
-        leaves_result = await client.get_month_leaves(token, year, month)
-        holidays_result = await client.get_holidays(token, year, month)
+        leaves_result, holidays_result = await asyncio.gather(
+            client.get_month_leaves(token, year, month),
+            client.get_holidays(token, year, month),
+        )
 
         leaves_data = (
             leaves_result.get("data", []) if leaves_result.get("status") == "success" else []
@@ -146,8 +160,17 @@ def register(mcp: FastMCP) -> None:
             half_day: Whether this is a half-day leave. Default is false.
             half_day_period: If half_day is true, specify 'first_half' or 'second_half'.
         """
+        _validate_date_str(start_date, "start_date")
+        _validate_date_str(end_date, "end_date")
         if len(reason) > MAX_LEAVE_REASON_LEN:
             raise ToolError(f"Reason too long (max {MAX_LEAVE_REASON_LEN} characters)")
+
+        if half_day and half_day_period not in _VALID_HALF_DAY_PERIODS:
+            raise ToolError(
+                f"half_day_period must be one of {_VALID_HALF_DAY_PERIODS} when half_day is true."
+            )
+        if half_day_period and not half_day:
+            raise ToolError("half_day must be true when half_day_period is specified.")
 
         start = date_type.fromisoformat(start_date)
         end = date_type.fromisoformat(end_date)
@@ -215,6 +238,8 @@ def register(mcp: FastMCP) -> None:
         """
         if days <= 0:
             raise ValueError("days must be a positive integer.")
+        if days > MAX_ENCASHMENT_DAYS:
+            raise ValueError(f"days exceeds maximum of {MAX_ENCASHMENT_DAYS}.")
 
         token, email = await get_erp_token()
         result = check_erp_result(
