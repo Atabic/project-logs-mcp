@@ -7,21 +7,25 @@ This guide walks you through adding new MCP tools that expose ERP API functional
 ```
 server.py           FastMCP instance, GoogleProvider auth, middleware, health check, lifespan
 _auth.py            Auth helpers — get_erp_token(), tool_error_handler(), check_erp_result()
-_constants.py       Shared constants — MAX_FILL_DAYS, MAX_QUERY_DAYS, MAX_DESCRIPTION_LEN, etc.
+_constants.py       Shared constants — MAX_FILL_DAYS, MAX_QUERY_DAYS, MAX_DESCRIPTION_LEN, MAX_LEAVE_DAYS, etc.
 clients/
   __init__.py       ERPClientRegistry (dataclass), get_registry(), set_registry()
   _base.py          BaseERPClient + TTLCache — HTTP transport, token exchange, static helpers
   timelogs.py       TimelogsClient — composition over inheritance, delegates to BaseERPClient.request()
+  leaves.py         LeavesClient — leave applications, balances, encashments
 tools/
-  __init__.py       Domain loader — AVAILABLE_DOMAINS, load_domains(mcp)
+  __init__.py       Domain loader — AVAILABLE_DOMAINS (timelogs, leaves), load_domains(mcp)
   timelogs.py       11 timelog tools inside register(mcp) pattern
+  leaves.py         10 leaves tools (7 read + 3 write) inside register(mcp) pattern
 tests/
   conftest.py                Sets env vars before module imports
   test_security.py           AST-based security tests (auto-discovers @mcp.tool across tools/*.py)
   test_feature_flags.py      Feature flag loader tests
   test_clients_base.py       BaseERPClient + TTLCache tests (respx-mocked HTTP)
   test_clients_timelogs.py   TimelogsClient tests (respx-mocked HTTP)
+  test_clients_leaves.py     LeavesClient tests (respx-mocked HTTP)
   test_tools_timelogs.py     Timelog tool tests (mocked registry + token)
+  test_tools_leaves.py       Leaves tool tests (mocked registry + token)
 ```
 
 **Data flow for every tool call:**
